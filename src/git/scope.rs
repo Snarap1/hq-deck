@@ -1,0 +1,1701 @@
+//! Review scopes: changed files, diffs, turn baselines, and forge identity.
+//!
+//! The only writes are private refs under `refs/worktree/reviewr/`. Nothing here
+//! commits, stages, or mutates the worktree, the index, or any branch — the staging side
+//! lives in [`super::porcelain`].
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+
+use super::{git, git_lenient, git_line, git_ok};
+use crate::model::{ChangeKind, ChangedFile, Scope};
+
+/// Whether `path` is inside a git work tree.
+pub fn is_repo(path: &Path) -> bool {
+    git_ok(path, &["rev-parse", "--is-inside-work-tree"])
+}
+
+/// The git top-level of `path`, or `None` if it is not a repo. Collapses "git ran and said no"
+/// and "git could not run" — use [`worktree_of`] when that difference matters.
+pub fn toplevel(path: &Path) -> Option<PathBuf> {
+    match worktree_of(path) {
+        Worktree::Root(root) => Some(root),
+        Worktree::Outside | Worktree::Unknown => None,
+    }
+}
+
+/// A directory's git top level, keeping "git ran and it is outside any worktree" (`Outside`, a
+/// determination) apart from "git could not be run at all" (`Unknown`, the absence of one — a
+/// spawn error under load). A caller deciding membership must hold on `Unknown` rather than read
+/// it as `Outside`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Worktree {
+    Root(PathBuf),
+    Outside,
+    Unknown,
+}
+
+/// Resolve `path` to its worktree, distinguishing the two ways resolution yields no root.
+pub fn worktree_of(path: &Path) -> Worktree {
+    match crate::proc::command("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Err(_) => Worktree::Unknown,
+        Ok(out) if !out.status.success() => Worktree::Outside,
+        Ok(out) => match String::from_utf8_lossy(&out.stdout).trim() {
+            "" => Worktree::Outside,
+            root => Worktree::Root(PathBuf::from(root)),
+        },
+    }
+}
+
+/// The forge a repository target belongs to. Part of the target's identity: the same path on
+/// a different forge is a different target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Forge {
+    /// The default carries the neutral `PR` vocabulary a forgeless state renders under.
+    #[default]
+    GitHub,
+    GitLab,
+}
+
+/// The per-forge display vocabulary — the CLI, noun, and reference table in
+impl Forge {
+    /// The forge's display name for link labels and failure wording.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::GitLab => "GitLab",
+        }
+    }
+
+    /// The forge's full noun: the word its users say.
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::GitHub => "pull request",
+            Self::GitLab => "merge request",
+        }
+    }
+
+    /// The forge's noun abbreviation: `PR` on GitHub, `MR` on GitLab.
+    pub fn abbr(self) -> &'static str {
+        match self {
+            Self::GitHub => "PR",
+            Self::GitLab => "MR",
+        }
+    }
+
+    /// The reference sigil before a number: `#226` on GitHub, `!42` on GitLab.
+    pub fn sigil(self) -> char {
+        match self {
+            Self::GitHub => '#',
+            Self::GitLab => '!',
+        }
+    }
+
+    /// The forge CLI's binary name.
+    pub fn cli(self) -> &'static str {
+        match self {
+            Self::GitHub => "gh",
+            Self::GitLab => "glab",
+        }
+    }
+}
+
+/// The self-hosted hostnames one validated config snapshot adds, one per forge
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForgeHosts<'a> {
+    pub github: Option<&'a str>,
+    pub gitlab: Option<&'a str>,
+}
+
+/// A canonical forge repository target: the forge, its hostname, and the repository path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoTarget {
+    forge: Forge,
+    host: String,
+    /// Exactly `[owner, name]` for GitHub; the full namespace path (2+ segments) for GitLab.
+    path: Vec<String>,
+}
+
+impl RepoTarget {
+    /// Build one canonical GitHub repository target from a hostname and owner/name pair.
+    #[cfg(test)]
+    pub(crate) fn new(host: &str, owner: &str, name: &str) -> Option<Self> {
+        Self::with_path(Forge::GitHub, host, &[owner, name])
+    }
+
+    /// Build one canonical target from a forge, hostname, and validated path segments.
+    pub(crate) fn with_path(forge: Forge, host: &str, segments: &[&str]) -> Option<Self> {
+        let host = host.to_ascii_lowercase();
+        let valid_len = match forge {
+            Forge::GitHub => segments.len() == 2,
+            // GitLab reserves `-` as the separator between a project path and the rest of a web
+            // URL, so a pasted browse link is a malformed remote, not a deep namespace.
+            Forge::GitLab => segments.len() >= 2 && !segments.contains(&"-"),
+        };
+        let components_ok = segments.iter().all(|part| valid_repository_component(part));
+        (crate::config::valid_host_syntax(&host) && valid_len && components_ok).then(|| Self {
+            forge,
+            host,
+            path: segments.iter().map(|part| (*part).to_string()).collect(),
+        })
+    }
+
+    /// The forge this target lives on.
+    pub fn forge(&self) -> Forge {
+        self.forge
+    }
+
+    /// The lowercase canonical forge hostname.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The first path segment — the owner at the GitHub API boundary.
+    pub fn owner(&self) -> &str {
+        &self.path[0]
+    }
+
+    /// The last path segment — the repository name at the GitHub API boundary.
+    pub fn name(&self) -> &str {
+        self.path.last().expect("a target has 2+ segments")
+    }
+
+    /// The full slash-joined repository path — the GitLab project identity.
+    pub fn full_path(&self) -> String {
+        self.path.join("/")
+    }
+}
+
+fn valid_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Host classification for one candidate repository remote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepositoryIdentity {
+    Repository(RepoTarget),
+    Missing,
+    Hostless,
+    Unsupported(String),
+    Malformed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteTransport {
+    Ssh,
+    Hosted,
+    Unsupported,
+}
+
+/// Classify one repository URL against the built-in forge hosts and the configured
+/// self-hosted keys.
+fn classify_remote(url: &str, hosts: &ForgeHosts<'_>) -> RepositoryIdentity {
+    let Some((transport, host, path, has_port)) = split_remote(url) else {
+        return RepositoryIdentity::Hostless;
+    };
+    if host.is_empty() {
+        return RepositoryIdentity::Hostless;
+    }
+    let host = host.to_ascii_lowercase();
+    if transport == RemoteTransport::Unsupported
+        || (transport == RemoteTransport::Hosted && has_port)
+    {
+        return RepositoryIdentity::Unsupported(host);
+    }
+    let Some(forge) = forge_for_host(&host, hosts) else {
+        return RepositoryIdentity::Unsupported(host);
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').collect();
+    let target = RepoTarget::with_path(forge, &host, &segments);
+    match target {
+        Some(target) => RepositoryIdentity::Repository(target),
+        None => RepositoryIdentity::Malformed(host),
+    }
+}
+
+/// The forge that recognizes `host`, if any — the one authority for the built-in host set.
+/// Config validation asks it with default hosts, so the sets cannot drift. Config validation
+/// also keeps the host sets disjoint, so at most one forge matches.
+pub(crate) fn forge_for_host(host: &str, hosts: &ForgeHosts<'_>) -> Option<Forge> {
+    if host == "github.com" || hosts.github == Some(host) {
+        return Some(Forge::GitHub);
+    }
+    if host == "gitlab.com" || hosts.gitlab == Some(host) {
+        return Some(Forge::GitLab);
+    }
+    None
+}
+
+/// Split a Git remote URL into transport, host, and path for scheme and scp-style forms.
+fn split_remote(url: &str) -> Option<(RemoteTransport, &str, &str, bool)> {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let rest = rest.split_once('@').map_or(rest, |(_, r)| r); // drop `user@`
+        let (hostport, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let (host, port) = hostport.split_once(':').map_or((hostport, None), |(h, p)| (h, Some(p)));
+        let transport = match scheme.to_ascii_lowercase().as_str() {
+            "ssh" => RemoteTransport::Ssh,
+            "http" | "https" | "git" => RemoteTransport::Hosted,
+            _ => RemoteTransport::Unsupported,
+        };
+        Some((transport, host, path, port.is_some()))
+    } else {
+        // scp-like `[user@]host:path` — the first `:` splits host from path.
+        let (hostpart, path) = url.split_once(':')?;
+        let host = hostpart.split_once('@').map_or(hostpart, |(_, h)| h);
+        Some((RemoteTransport::Ssh, host, path, false))
+    }
+}
+
+// --- PR-fetch local reads (branch names) ------------------------------------
+//
+// Repository selection and
+// branch-state derivation both use the same failure contract: a git command that *fails* is a
+// transient [`GitFail`], never read as absence. The caller distinguishes a target read failure
+// from a later branch-state failure so only an unproven target replaces the visible snapshot.
+
+/// A git command that failed (spawn error or unexpected non-zero exit) during the PR
+/// fetch's local reads — a transient failure per, never absence.
+#[derive(Debug)]
+pub struct GitFail(pub String);
+
+/// Spawn one PR-fetch git read. `LC_ALL=C` pins Git's messages to English — remote discovery
+/// classifies a missing remote by stderr text, which Git otherwise localizes.
+fn run_git(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitFail> {
+    crate::proc::command("git")
+        .arg("-C")
+        .arg(repo)
+        .env("LC_ALL", "C")
+        .args(args)
+        .output()
+        .map_err(|e| GitFail(format!("git {args:?}: {e}")))
+}
+
+/// Run git where exit 0 is a value, exit 1 is a designated clean absence (`--verify
+/// --quiet`, `symbolic-ref --quiet`, `cat-file -e`), and anything else is a failure.
+fn git_tristate(repo: &Path, args: &[&str]) -> Result<Option<String>, GitFail> {
+    let out = run_git(repo, args)?;
+    if out.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()));
+    }
+    if out.status.code() == Some(1) {
+        return Ok(None);
+    }
+    Err(GitFail(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim())))
+}
+
+/// Run git where any non-zero exit is a failure. Exit 0 with empty output is a clean
+/// "found nothing" (e.g. `for-each-ref` matching no refs).
+fn git_strict(repo: &Path, args: &[&str]) -> Result<String, GitFail> {
+    let out = run_git(repo, args)?;
+    if !out.status.success() {
+        return Err(GitFail(format!(
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Everything that determines one PR fetch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrFetchInput {
+    pub repository: RepositoryIdentity,
+    /// The `origin` repository, when it is a usable forge identity — on a fork clone it
+    /// is the fork, queried beside the target.
+    pub origin_repository: Option<RepoTarget>,
+    /// The locally derived pins and branch names, read in the same pass.
+    pub local: PrLocalState,
+}
+
+/// The local identity one PR fetch derives: the pins and the branch's forge names.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrLocalState {
+    /// `HEAD` pinned to an OID at the start of the pass; every ancestry test, distance,
+    /// and the `sync` count use this pin, so one fetch reads one consistent local state.
+    pub head_oid: Option<String>,
+    /// The winning base entry pinned to an OID — the paint guard keys on it, so a base
+    /// moving mid-fetch never paints a stale verdict.
+    pub base_oid: Option<String>,
+    /// The branch's forge names: the checked-out branch's own name, its recorded upstream,
+    /// and the `origin` branch names at the pushed frontier — the branch the work was
+    /// pushed to, whatever its local name.
+    pub names: Vec<String>,
+    /// `HEAD` is detached — no branch, no PR story.
+    pub detached: bool,
+}
+
+/// The checked-out branch's short name, or `None` on a detached `HEAD`.
+pub fn current_branch(repo: &Path) -> Result<Option<String>, GitFail> {
+    git_tristate(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+}
+
+/// Derive the pinned `HEAD`, the pinned base, and the branch's forge names
+pub fn pr_local(repo: &Path, base_flag: Option<&str>) -> Result<PrLocalState, GitFail> {
+    let Some(branch) = current_branch(repo)? else {
+        return Ok(PrLocalState { detached: true, ..PrLocalState::default() });
+    };
+    let head_oid = git_tristate(repo, &["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])?;
+    let resolution = resolve_base(repo, base_flag)?;
+    let bases = resolution.oids();
+    let mut names = vec![branch.clone()];
+    let push_name = |name: String, names: &mut Vec<String>| {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    if let Some(upstream) = recorded_upstream(repo, &branch, &resolution.recorded, &bases)? {
+        push_name(upstream, &mut names);
+    }
+    if let Some(head) = &head_oid
+        && !bases.is_empty()
+    {
+        for name in frontier_names(repo, head, &bases)? {
+            push_name(name, &mut names);
+        }
+    }
+    // A frontier of many refs stays bounded, so the per-name forge queries do.
+    names.truncate(8);
+    Ok(PrLocalState { head_oid, base_oid: bases.into_iter().next(), names, detached: false })
+}
+
+/// The winning base: a branch (origin then local) or any other spelling
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedBase {
+    Branch { name: String, oid: String },
+    Rev { spelling: String, oid: String },
+}
+
+impl ResolvedBase {
+    fn branch(name: String, oid: String) -> Self {
+        Self::Branch { name, oid }
+    }
+
+    fn rev(spelling: String, oid: String) -> Self {
+        Self::Rev { spelling, oid }
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Branch { name, .. } => name,
+            Self::Rev { spelling, .. } => spelling,
+        }
+    }
+
+    #[must_use]
+    pub fn oid(&self) -> &str {
+        match self {
+            Self::Branch { oid, .. } | Self::Rev { oid, .. } => oid,
+        }
+    }
+}
+
+/// The chain outcome the header paints: the winner and the first recorded choice the
+/// chain skipped because it no longer resolves. The skip rides beside the winner, not
+/// inside it, so it survives a chain where nothing resolves at all — a dormant pick
+/// never reads as never-chosen.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BaseStatus {
+    pub winner: Option<ResolvedBase>,
+    pub skipped: Option<String>,
+}
+
+/// One pass over the base chain. `candidates` keeps every source that resolved, in
+/// precedence order and deduped by OID — the PR frontier walk needs all of them, not just
+/// the winner (`pr_local`). `recorded` keeps every source name the chain considered —
+/// every candidate's name and every dormant one's, since a pick that fails to resolve
+/// still shields its name from the PR name lookup.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BaseResolution {
+    pub status: BaseStatus,
+    candidates: Vec<ResolvedBase>,
+    recorded: Vec<String>,
+}
+
+impl BaseResolution {
+    fn oids(&self) -> Vec<String> {
+        self.candidates.iter().map(|c| c.oid().to_string()).collect()
+    }
+}
+
+/// Resolve the base chain: the `--base` flag, then this worktree's pick, then the branch
+/// `origin/HEAD` names. A source that does not
+/// resolve to a commit is skipped, never an error; a skipped flag or pick that would have
+/// outranked the winner is recorded for the header.
+pub fn resolve_base(repo: &Path, base_flag: Option<&str>) -> Result<BaseResolution, GitFail> {
+    let mut candidates: Vec<ResolvedBase> = Vec::new();
+    let mut recorded: Vec<String> = Vec::new();
+    let mut skipped: Option<String> = None;
+    let push = |c: ResolvedBase, list: &mut Vec<ResolvedBase>| {
+        if !list.iter().any(|x| x.oid() == c.oid()) {
+            list.push(c);
+        }
+    };
+    let record = |name: String, r: &mut Vec<String>| {
+        if !name.is_empty() && !r.contains(&name) {
+            r.push(name);
+        }
+    };
+    if let Some(flag) = base_flag.filter(|b| !b.is_empty()) {
+        let (hit, skip) = classify_flag(repo, flag)?;
+        if let Some(c) = hit {
+            record(c.name().to_string(), &mut recorded);
+            push(c, &mut candidates);
+        }
+        if let Some(s) = skip {
+            record(s.clone(), &mut recorded);
+            skipped = Some(s);
+        }
+    }
+    if let Some(pick) = read_base_pick(repo)? {
+        record(pick.clone(), &mut recorded);
+        match resolve_spelling(repo, &pick)? {
+            Some(c) => push(c, &mut candidates),
+            None if candidates.is_empty() => skipped = skipped.or(Some(pick)),
+            None => {}
+        }
+    }
+    if let Some(name) = default_branch_name(repo)? {
+        record(name.clone(), &mut recorded);
+        if let Some(oid) = resolve_base_entry(repo, &name)? {
+            push(ResolvedBase::branch(name, oid), &mut candidates);
+        }
+    }
+    let winner = candidates.first().cloned();
+    Ok(BaseResolution { status: BaseStatus { winner, skipped }, candidates, recorded })
+}
+
+/// The branch name `origin/HEAD` points at. Some
+/// clones carry `origin/HEAD` as a plain ref instead of a symref — then the name is the
+/// origin tip whose commit matches it.
+pub fn default_branch_name(repo: &Path) -> Result<Option<String>, GitFail> {
+    let target = git_tristate(repo, &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"])?;
+    if let Some(name) =
+        target.and_then(|t| t.strip_prefix("refs/remotes/origin/").map(str::to_string))
+    {
+        // `fetch --prune` can delete the target and leave the symref dangling: a name
+        // that resolves to nothing is no default, or the picker could never mark the
+        // default row and the name shield would carry a phantom.
+        let probe = format!("refs/remotes/origin/{name}^{{commit}}");
+        let resolves = git_tristate(repo, &["rev-parse", "--verify", "--quiet", &probe])?;
+        return Ok(resolves.map(|_| name));
+    }
+    let Some(oid) = git_tristate(
+        repo,
+        &["rev-parse", "--verify", "--quiet", "refs/remotes/origin/HEAD^{commit}"],
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(origin_tips(repo)?.into_iter().find_map(|(tip, name)| (tip == oid).then_some(name)))
+}
+
+/// Strip the ref prefixes a `--base` branch name may carry.
+pub(crate) fn strip_base_prefix(entry: &str) -> String {
+    ["refs/remotes/origin/", "refs/heads/", "origin/"]
+        .iter()
+        .find_map(|p| entry.strip_prefix(p))
+        .unwrap_or(entry)
+        .to_string()
+}
+
+/// Every branch name for the base picker: `refs/heads` and `refs/remotes/origin` merged by
+/// bare name, newest commit first, `origin/HEAD` and the checked-out branch excluded —
+/// except the `default` branch, which stays listed so it can be picked even while checked
+/// out. The caller passes the default it already resolved, so one picker open runs the
+/// resolution once.
+pub fn list_branches(repo: &Path, default: Option<&str>) -> Result<Vec<String>, GitFail> {
+    let checked_out = current_branch(repo)?.filter(|name| default != Some(name));
+    let out = git_strict(
+        repo,
+        &[
+            "for-each-ref",
+            "refs/heads",
+            "refs/remotes/origin",
+            "--sort=-committerdate",
+            "--format=%(refname)",
+        ],
+    )?;
+    let mut names: Vec<String> = Vec::new();
+    for line in out.lines() {
+        let name =
+            line.strip_prefix("refs/remotes/origin/").or_else(|| line.strip_prefix("refs/heads/"));
+        let Some(name) = name else { continue };
+        if name == "HEAD" || checked_out.as_deref() == Some(name) {
+            continue;
+        }
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// The `origin` remote-tracking tips as `(OID, bare name)`, `origin/HEAD` excluded — one
+/// listing per pass serves the frontier names and the published-at-all short-circuit.
+fn origin_tips(repo: &Path) -> Result<Vec<(String, String)>, GitFail> {
+    let out = git_strict(
+        repo,
+        &["for-each-ref", "refs/remotes/origin", "--format=%(objectname) %(refname)"],
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let (oid, refname) = line.split_once(' ')?;
+            let name = refname.strip_prefix("refs/remotes/origin/")?;
+            (name != "HEAD").then(|| (oid.to_string(), name.to_string()))
+        })
+        .collect())
+}
+
+/// The `origin` branch names at the pushed frontier: the names of the tips at the boundary
+/// of the unpushed range — or at `head` itself when nothing is unpushed. A tip on base
+/// history carries no work of this branch and contributes no name. Bounded at 32 boundary
+/// commits, so a merge-heavy frontier stays cheap.
+fn frontier_names(repo: &Path, head: &str, bases: &[String]) -> Result<Vec<String>, GitFail> {
+    let tips = origin_tips(repo)?;
+    if tips.is_empty() {
+        // Nothing is published at all; skip the history walk, which `--not
+        // --remotes=origin` would otherwise run unbounded.
+        return Ok(Vec::new());
+    }
+    let out = git_strict(repo, &["rev-list", "--boundary", head, "--not", "--remotes=origin"])?;
+    let mut oids: Vec<String> = Vec::new();
+    let mut saw_unpushed = false;
+    for line in out.lines() {
+        match line.strip_prefix('-') {
+            Some(boundary) => oids.push(boundary.to_string()),
+            None if !line.is_empty() => saw_unpushed = true,
+            None => {}
+        }
+    }
+    if !saw_unpushed && oids.is_empty() {
+        // Nothing is unpushed: HEAD itself is published.
+        oids.push(head.to_string());
+    }
+    oids.truncate(32);
+    let mut names = Vec::new();
+    for oid in oids {
+        // The caller keeps at most 8 names, so stop paying git calls past that.
+        if names.len() >= 8 {
+            break;
+        }
+        if !beyond_all_bases(repo, &oid, bases)? {
+            continue;
+        }
+        for (tip, name) in &tips {
+            if tip == &oid && !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// Whether `commit` is an ancestor of (or equal to) `of`.
+fn is_ancestor(repo: &Path, commit: &str, of: &str) -> Result<bool, GitFail> {
+    Ok(git_tristate(repo, &["merge-base", "--is-ancestor", commit, of])?.is_some())
+}
+
+/// Whether the pinned `HEAD` contains `commit` — the merged/closed admission guard: a
+/// reused branch name never resurrects a PR whose commits this branch does not hold
+/// A commit absent from the object database is not
+/// contained; an unfetched head proves nothing.
+pub fn contains_commit(repo: &Path, head: &str, commit: &str) -> Result<bool, GitFail> {
+    if git_tristate(repo, &["cat-file", "-e", commit])?.is_none() {
+        return Ok(false);
+    }
+    is_ancestor(repo, commit, head)
+}
+
+/// Whether `oid` lies beyond every resolved base — an ancestor of none of them. Decides which
+/// frontier tips carry provable work.
+fn beyond_all_bases(repo: &Path, oid: &str, bases: &[String]) -> Result<bool, GitFail> {
+    for base in bases {
+        if is_ancestor(repo, oid, base)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The target and origin identities from one read of each remote. The target resolves from
+/// a readable supported `upstream`, falling back to `origin`; unusable identities fall
+/// back, read errors do not. The origin identity rides along for the fork lookup —
+/// on a fork clone the fork's own PRs live there. A usable `upstream`
+/// already fixes the target, so an `origin` read that fails then costs only that fetch's
+/// association source, not the whole read.
+pub(crate) fn remote_identities(
+    repo: &Path,
+    hosts: &ForgeHosts<'_>,
+) -> Result<(RepositoryIdentity, Option<RepoTarget>), GitFail> {
+    let upstream = remote_identity(repo, "upstream", hosts)?;
+    let origin = remote_identity(repo, "origin", hosts);
+    let origin_target = match &origin {
+        Ok(RepositoryIdentity::Repository(target)) => Some(target.clone()),
+        _ => None,
+    };
+    let repository =
+        if matches!(upstream, RepositoryIdentity::Repository(_)) { upstream } else { origin? };
+    Ok((repository, origin_target))
+}
+
+/// Classify one rewritten primary fetch URL. A missing remote is a clean state; every other
+/// `remote get-url` failure is transient. The command applies `url.*.insteadOf` rewrites.
+fn remote_identity(
+    repo: &Path,
+    remote: &str,
+    hosts: &ForgeHosts<'_>,
+) -> Result<RepositoryIdentity, GitFail> {
+    let args = ["remote", "get-url", "--", remote];
+    let out = run_git(repo, &args)?;
+    if out.status.success() {
+        let url = std::str::from_utf8(&out.stdout)
+            .map_err(|_| GitFail(format!("git remote get-url {remote}: invalid UTF-8")))?;
+        return Ok(classify_remote(url.trim(), hosts));
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.to_lowercase().contains("no such remote") {
+        return Ok(RepositoryIdentity::Missing);
+    }
+    Err(GitFail(format!("git {args:?}: {}", stderr.trim())))
+}
+
+/// Peel `rev` to a commit object id. A leading `-` is not a
+/// rev. An ambiguous abbreviated SHA is a miss, not an error.
+pub fn resolve_commit(repo: &Path, rev: &str) -> Result<Option<String>, GitFail> {
+    if rev.is_empty() || rev.starts_with('-') {
+        return Ok(None);
+    }
+    let probe = format!("{rev}^{{commit}}");
+    git_tristate(repo, &["rev-parse", "--verify", "--quiet", &probe])
+}
+
+/// The abbreviated object id the header and the picker paint.
+#[must_use]
+pub fn abbreviate_oid(oid: &str) -> String {
+    const N: usize = 7;
+    if oid.len() <= N { oid.to_string() } else { oid[..N].to_string() }
+}
+
+/// Whether `spelling` is a hex prefix of `oid`.
+#[must_use]
+pub fn spelling_is_sha_prefix(spelling: &str, oid: &str) -> bool {
+    let s = spelling.to_ascii_lowercase();
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_hexdigit())
+        && oid.to_ascii_lowercase().starts_with(&s)
+}
+
+/// Shown name and optional abbreviated SHA for a non-branch spelling. A SHA prefix paints once; anything else keeps the spelling and
+/// carries the mark.
+#[must_use]
+pub fn rev_paint(spelling: &str, oid: &str) -> (String, Option<String>) {
+    let abbrev = abbreviate_oid(oid);
+    if spelling_is_sha_prefix(spelling, oid) {
+        (abbrev, None)
+    } else {
+        (spelling.to_string(), Some(abbrev))
+    }
+}
+
+/// Complete a unique SHA prefix to the abbreviated object id. A spelling that is
+/// already that abbrev, or a longer hex prefix of the oid (a pasted 40-hex), is kept
+#[must_use]
+pub fn complete_sha_prefix(spelling: &str, oid: &str) -> String {
+    let abbrev = abbreviate_oid(oid);
+    if spelling_is_sha_prefix(spelling, oid) && spelling.len() < abbrev.len() {
+        abbrev
+    } else {
+        spelling.to_string()
+    }
+}
+
+/// A branch name the picker would list, not `HEAD` and not a rev-walk.
+#[must_use]
+pub fn is_branch_label(value: &str) -> bool {
+    branch_name_shaped(value) && !value.eq_ignore_ascii_case("HEAD")
+}
+
+/// Origin then local, else a verbatim commit.
+pub(crate) fn resolve_spelling(
+    repo: &Path,
+    spelling: &str,
+) -> Result<Option<ResolvedBase>, GitFail> {
+    if let Some(oid) = resolve_base_entry(repo, spelling)? {
+        return Ok(Some(ResolvedBase::branch(spelling.to_string(), oid)));
+    }
+    Ok(resolve_commit(repo, spelling)?.map(|oid| ResolvedBase::rev(spelling.to_string(), oid)))
+}
+
+/// `--base`: verbatim first, else prefix-stripped as a branch. A miss keeps the flag
+/// spelling unless the stripped form is a branch name.
+fn classify_flag(
+    repo: &Path,
+    flag: &str,
+) -> Result<(Option<ResolvedBase>, Option<String>), GitFail> {
+    let entry = strip_base_prefix(flag);
+    let verbatim = resolve_commit(repo, flag)?;
+    let via_branch = resolve_base_entry(repo, &entry)?;
+    Ok(match (verbatim, via_branch) {
+        (Some(oid), None) => (Some(ResolvedBase::rev(flag.to_string(), oid)), None),
+        (Some(oid), Some(_)) | (None, Some(oid)) => (Some(ResolvedBase::branch(entry, oid)), None),
+        (None, None) => {
+            let skip = if is_branch_label(&entry) { entry } else { flag.to_string() };
+            (None, Some(skip))
+        }
+    })
+}
+
+fn resolve_base_entry(repo: &Path, name: &str) -> Result<Option<String>, GitFail> {
+    if !is_branch_label(name) {
+        return Ok(None);
+    }
+    for prefix in ["refs/remotes/origin/", "refs/heads/"] {
+        let probe = format!("{prefix}{name}^{{commit}}");
+        if let Some(oid) = git_tristate(repo, &["rev-parse", "--verify", "--quiet", &probe])? {
+            return Ok(Some(oid));
+        }
+    }
+    Ok(None)
+}
+
+/// git's recorded upstream for `branch` (`branch.<name>.remote`/`merge`) as a bare branch
+/// name, or `None` when unset, not under a remote, or naming a resolved base — the record
+/// `git switch -c work origin/main` auto-writes is tracking, not publication. A base
+/// resolved without a configured name — through `origin/HEAD` or a verbatim `--base` rev —
+/// is recognized by its tip OID in `base_oids` instead. `for-each-ref` exits 0 with an empty
+/// field when unset, so absence never reads as failure (`rev-parse @{u}` exits 128 for
+/// both). `%(push)` is deliberately not consulted: with any remote present git *computes*
+/// a destination even with nothing recorded, which would shadow a real record.
+fn recorded_upstream(
+    repo: &Path,
+    branch: &str,
+    base_names: &[String],
+    base_oids: &[String],
+) -> Result<Option<String>, GitFail> {
+    let out = git_strict(
+        repo,
+        &["for-each-ref", &format!("refs/heads/{branch}"), "--format=%(upstream)"],
+    )?;
+    let dest = out.lines().next().unwrap_or("").trim();
+    let Some(rest) = dest.strip_prefix("refs/remotes/") else { return Ok(None) };
+    let Some((_, name)) = rest.split_once('/') else { return Ok(None) };
+    if name.is_empty() || base_names.iter().any(|entry| entry == name) {
+        return Ok(None);
+    }
+    // A pruned upstream ref no longer resolves; the record still carries the name
+    // (a stale local record costs recall, never correctness).
+    let probe = format!("{dest}^{{commit}}");
+    if let Some(tip) = git_tristate(repo, &["rev-parse", "--verify", "--quiet", &probe])?
+        && base_oids.contains(&tip)
+    {
+        return Ok(None);
+    }
+    Ok(Some(name.to_string()))
+}
+
+/// Commits `local` (the pinned `HEAD` OID) is ahead and behind `other` (the PR head OID).
+/// `Ok(None)` when `other` is not in the object database — the PR head was never fetched
+/// locally, a clean absence. Backs the PR `sync` indicator.
+pub fn ahead_behind_oids(
+    repo: &Path,
+    local: &str,
+    other: &str,
+) -> Result<Option<(u32, u32)>, GitFail> {
+    // Plain `-e` (no `^{commit}` peel): peeling a missing object exits 128, not the
+    // clean-absence 1 this check relies on.
+    if git_tristate(repo, &["cat-file", "-e", other])?.is_none() {
+        return Ok(None);
+    }
+    let out =
+        git_strict(repo, &["rev-list", "--left-right", "--count", &format!("{local}...{other}")])?;
+    let mut it = out.split_whitespace();
+    let parse = |s: Option<&str>| {
+        s.and_then(|v| v.parse().ok())
+            .ok_or_else(|| GitFail(format!("rev-list --left-right returned {out:?}")))
+    };
+    let ahead = parse(it.next())?;
+    let behind = parse(it.next())?;
+    Ok(Some((ahead, behind)))
+}
+
+/// The merge-base commit of the resolved base OID and `HEAD`
+pub fn merge_base(repo: &Path, base_oid: &str) -> Option<String> {
+    git_line(repo, &["merge-base", base_oid, "HEAD"])
+}
+
+/// The content of `path` at `rev` (`git show <rev>:<path>`). Empty when the path does
+/// not exist at that rev — an added file against its old side, say.
+pub fn file_content(repo: &Path, rev: &str, path: &str) -> String {
+    git_lenient(repo, &["show", &format!("{rev}:{path}")])
+}
+
+// --- base pick (branch scope) --------------------------------------------------
+//
+// One revision spelling per worktree: a blob under `refs/worktree/reviewr/base-pick`.
+// Git isolates that namespace, so sibling worktrees do not share a pick.
+
+const BASE_PICK_REF: &str = "refs/worktree/reviewr/base-pick";
+const TURN_BASE_REF: &str = "refs/worktree/reviewr/turn-base";
+
+/// The recorded pick's spelling, or `None` when no pick is recorded. One git call, so a
+/// concurrent write from another pane of this worktree can never split the read the way
+/// an exists-then-read pair would; a failed read is no pick, matching the chain's
+/// skip-never-error contract.
+pub fn read_base_pick(repo: &Path) -> Result<Option<String>, GitFail> {
+    let out = run_git(repo, &["cat-file", "blob", BASE_PICK_REF])?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let name = String::from_utf8_lossy(&out.stdout);
+    let name = name.trim();
+    Ok(pick_spelling_shaped(name).then(|| name.to_string()))
+}
+
+/// One printable line, not a git option. `HEAD~1` and a tag are
+/// picks. Control bytes are not.
+fn pick_spelling_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.bytes().all(|byte| byte > b' ' && byte != 0x7f)
+}
+
+/// Shape of a branch name the origin-then-local walk will accept. `HEAD` and rev-walk
+/// spellings (`HEAD~1`) are not: git would parse them through `origin/HEAD`.
+fn branch_name_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains(['~', '^', ':', '?', '*', '[', '\\'])
+        && value.bytes().all(|byte| byte > b' ' && byte != 0x7f)
+}
+
+/// Record `name` as this worktree's pick. The ref write lands before the pick applies,
+/// so a crash between the two loses nothing.
+pub fn write_base_pick(repo: &Path, name: &str) -> Result<(), GitFail> {
+    let blob = git_stdin(repo, &["hash-object", "-w", "--stdin"], name)?;
+    git_strict(repo, &["update-ref", BASE_PICK_REF, blob.trim()])?;
+    Ok(())
+}
+
+/// Run git with `input` piped to stdin, any non-zero exit a failure.
+fn git_stdin(repo: &Path, args: &[&str], input: &str) -> Result<String, GitFail> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = crate::proc::command("git")
+        .arg("-C")
+        .arg(repo)
+        .env("LC_ALL", "C")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| GitFail(format!("git {args:?}: {e}")))?;
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(input.as_bytes())
+        .map_err(|e| GitFail(format!("git {args:?}: {e}")))?;
+    let out = child.wait_with_output().map_err(|e| GitFail(format!("git {args:?}: {e}")))?;
+    if !out.status.success() {
+        return Err(GitFail(format!(
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// --- turn baseline (last-turn scope) -------------------------------------------
+//
+// The snapshot is non-disruptive: it writes a tree object from the worktree through
+// a temporary index, never touching the real index, the worktree, or any branch, and
+// persists the baseline at `refs/worktree/reviewr/turn-base`.
+
+/// A non-disruptive snapshot of the worktree as a tree object. Seeds a temporary index
+/// from the repo's real index so unchanged files keep their cached hash, then `add -A`
+/// and `write-tree`. Captures staged, unstaged, and untracked content alike. Touches
+/// only the object database and the temp index — never the real index or any ref.
+pub fn snapshot_worktree(repo: &Path) -> Result<String> {
+    let git_dir = PathBuf::from(git(repo, &["rev-parse", "--absolute-git-dir"])?.trim());
+    let tmp_index = git_dir.join("reviewr-turn-index");
+    let real_index = git_dir.join("index");
+    // Clear whatever a prior hard crash left — the temp index and the `.lock` git holds
+    // while writing it (a leftover lock fails every later `add` with "File exists") — then
+    // drop both on every exit path via the guard, so even a failed snapshot leaves nothing
+    // behind in the git dir.
+    let guard = TempIndex(&tmp_index);
+    guard.clear();
+    // Seed from the real index so git's stat cache lets unchanged files skip hashing;
+    // a fresh repo may have no index yet, so start empty in that case.
+    if real_index.exists() {
+        std::fs::copy(&real_index, &tmp_index).context("seeding the snapshot index")?;
+    }
+    git_with_index(repo, &tmp_index, &["add", "-A"])?;
+    let tree = git_with_index(repo, &tmp_index, &["write-tree"])?;
+    Ok(tree.trim().to_string())
+}
+
+/// Removes a temporary index and its git lock file on drop, so a snapshot that fails midway
+/// never leaves either behind.
+struct TempIndex<'a>(&'a Path);
+
+impl TempIndex<'_> {
+    /// Removes the index and the `<index>.lock` git creates beside it while writing. Safe at
+    /// any point we run: the lock's only legitimate holder is a live `git add` this process
+    /// spawned and has already waited on.
+    fn clear(&self) {
+        let _ = std::fs::remove_file(self.0);
+        let mut lock = self.0.as_os_str().to_owned();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(Path::new(&lock));
+    }
+}
+
+impl Drop for TempIndex<'_> {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Like [`git`], but runs against a throwaway index via `GIT_INDEX_FILE` so the snapshot
+/// never disturbs the repo's real index.
+fn git_with_index(repo: &Path, index: &Path, args: &[&str]) -> Result<String> {
+    let out = crate::proc::command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "core.quotepath=false"])
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
+        .output()
+        .with_context(|| format!("running git {args:?}"))?;
+    if !out.status.success() {
+        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The persisted turn baseline tree for this worktree, if a baseline exists.
+pub fn read_baseline_ref(repo: &Path) -> Option<String> {
+    git_line(repo, &["rev-parse", "--verify", "--quiet", TURN_BASE_REF])
+}
+
+/// Persist the turn baseline tree under this worktree's private ref. `update-ref` is
+/// atomic, so the baseline is never half-written.
+pub fn write_baseline_ref(repo: &Path, sha: &str) -> Result<()> {
+    git(repo, &["update-ref", TURN_BASE_REF, sha])?;
+    Ok(())
+}
+
+/// git's well-known empty-tree object, used as the diff base when a repo has no commits.
+pub const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/// `HEAD` when the repo has a commit, else the empty tree (a commitless repo has no HEAD).
+fn diff_base(repo: &Path) -> String {
+    if git(repo, &["rev-parse", "--verify", "-q", "HEAD"]).is_ok() {
+        "HEAD".to_string()
+    } else {
+        EMPTY_TREE.to_string()
+    }
+}
+
+/// The changed files for `scope`, sorted by path. `branch_base` is the resolved base OID
+/// for the `branch` scope ([`resolve_base`]'s winner); with none the scope lists nothing.
+/// `last-turn` is resolved separately by [`changed_against_tree`], so it lists nothing here.
+pub fn changed_files(
+    repo: &Path,
+    scope: Scope,
+    branch_base: Option<&str>,
+) -> Result<Vec<ChangedFile>> {
+    let (numstat, name_status) = match scope {
+        Scope::Uncommitted => {
+            // A repo with no commits has no HEAD; diff against the empty tree so a fresh
+            // `git init` lists its files instead of erroring (which would kill the process).
+            let base = diff_base(repo);
+            (
+                git(repo, &["diff", &base, "--numstat", "-z"])?,
+                git(repo, &["diff", &base, "--name-status", "-z"])?,
+            )
+        }
+        Scope::Branch => match branch_base.and_then(|b| merge_base(repo, b)) {
+            Some(r) => (
+                git(repo, &["diff", &r, "--numstat", "-z"])?,
+                git(repo, &["diff", &r, "--name-status", "-z"])?,
+            ),
+            None => return Ok(Vec::new()),
+        },
+        // `last-turn` and `commits` diff through their own entry points.
+        Scope::LastTurn | Scope::Commits => return Ok(Vec::new()),
+    };
+    // Branch diffs against the worktree, so like uncommitted it carries untracked files
+    // that `git diff` never reports.
+    let include_untracked = matches!(scope, Scope::Uncommitted | Scope::Branch);
+    assemble(repo, &numstat, &name_status, include_untracked)
+}
+
+/// The changed files between the turn baseline `tree` and the live worktree, for
+/// `last-turn`. Snapshots the worktree now and diffs tree-against-tree, so staged,
+/// unstaged, untracked, and committed-this-turn changes all show, with no phantom
+/// deletion for a file that is untracked at both ends (which a tree-vs-worktree diff
+/// would mis-report). Untracked files ride in the current snapshot, so no separate
+/// untracked pass is needed.
+pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>> {
+    let current = snapshot_worktree(repo)?;
+    let numstat = git(repo, &["diff", tree, &current, "--numstat", "-z"])?;
+    let name_status = git(repo, &["diff", tree, &current, "--name-status", "-z"])?;
+    assemble(repo, &numstat, &name_status, false)
+}
+
+/// The changed files between two commits, `old` against `new`, for the `commits` scope:
+/// both sides are committed trees, so no untracked pass runs. `old` may be the empty tree for a root commit.
+pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
+    let numstat = git(repo, &["diff", old, new, "--numstat", "-z"])?;
+    let name_status = git(repo, &["diff", old, new, "--name-status", "-z"])?;
+    assemble(repo, &numstat, &name_status, false)
+}
+
+/// `sha`'s first parent, or the empty tree when `sha` is a root commit: the old side of a
+/// run whose oldest commit is `sha`. `None` when the
+/// commit itself is missing. The parent is read from the raw commit object, so a parent the
+/// repository lacks (a shallow clone's cut) is named, not mistaken for a root: the caller's
+/// existence check then reports it `gone`.
+pub fn parent_or_empty(repo: &Path, sha: &str) -> Option<String> {
+    let object = git(repo, &["cat-file", "-p", &format!("{sha}^{{commit}}")]).ok()?;
+    let parent = object
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .find_map(|l| l.strip_prefix("parent "))
+        .map_or(EMPTY_TREE, str::trim);
+    Some(parent.to_string())
+}
+
+/// The commit `HEAD` names, or `None` in an unborn repository. The commit picker's universe
+/// is keyed by it, so a poll re-lists only when it moved.
+pub fn head_oid(repo: &Path) -> Option<String> {
+    git_line(repo, &["rev-parse", "--verify", "-q", "HEAD"])
+}
+
+/// `sha`'s subject line, for the header paint.
+pub fn commit_subject(repo: &Path, sha: &str) -> Option<String> {
+    git_line(repo, &["log", "-1", "--format=%s", sha])
+}
+
+/// Whether `sha` names a commit the repository still holds (`gone`).
+pub fn commit_exists(repo: &Path, sha: &str) -> bool {
+    git_ok(repo, &["cat-file", "-e", &format!("{sha}^{{commit}}")])
+}
+
+/// Whether `sha` is reachable from `HEAD` (`off branch`). A missing
+/// commit is unreachable.
+pub fn is_reachable(repo: &Path, sha: &str) -> bool {
+    git_ok(repo, &["merge-base", "--is-ancestor", sha, "HEAD"])
+}
+
+/// How many commits `oldest..=newest` spans along the first-parent walk from `newest`
+/// `None` when either end is missing, or `oldest` is not behind `newest`.
+pub fn run_length(repo: &Path, oldest: &str, newest: &str) -> Option<usize> {
+    let old = parent_or_empty(repo, oldest)?;
+    run_length_from(repo, &old, oldest, newest)
+}
+
+/// [`run_length`] with `oldest`'s parent already resolved, so a build that has it spawns
+/// nothing twice.
+pub fn run_length_from(repo: &Path, old: &str, oldest: &str, newest: &str) -> Option<usize> {
+    if oldest == newest {
+        return Some(1);
+    }
+    let mut args = vec!["rev-list", "--count", "--first-parent", newest];
+    let exclude;
+    if old != EMPTY_TREE {
+        if !git_ok(repo, &["merge-base", "--is-ancestor", oldest, newest]) {
+            return None;
+        }
+        exclude = format!("^{old}");
+        args.push(&exclude);
+    }
+    git_line(repo, &args)?.parse().ok()
+}
+
+/// One row of the commit picker: the full id, the subject,
+/// the committer time as unix seconds, the author, the refs pointing at it, and whether it
+/// is a merge.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CommitRow {
+    pub sha: String,
+    pub subject: String,
+    pub time: u64,
+    pub author: String,
+    /// The refs pointing at the commit, `HEAD` and the checked-out branch dropped.
+    pub refs: Vec<CommitRef>,
+    pub merge: bool,
+}
+
+/// A ref a picker row can show, by kind, so the row's one ref ranks by what it is rather
+/// than by how it is spelled.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CommitRef {
+    /// A remote-tracking tip, shown as `origin/feature`.
+    Remote(String),
+    /// A tag, shown as `tag: v1`.
+    Tag(String),
+    /// A local branch other than the one checked out, shown by name.
+    Branch(String),
+}
+
+impl CommitRef {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Remote(r) | Self::Branch(r) => r.clone(),
+            Self::Tag(t) => format!("tag: {t}"),
+        }
+    }
+}
+
+/// The picker's universe, newest first, along the first-parent walk from `HEAD`:
+/// `merge_base..HEAD` when the base has one, or the last 50 commits without. First-parent only, so any contiguous run of rows is one ancestor
+/// chain and diffs as `A^..B`. An unborn repository lists nothing.
+pub fn list_commits(repo: &Path, merge_base: Option<&str>) -> Result<Vec<CommitRow>> {
+    if head_oid(repo).is_none() {
+        return Ok(Vec::new());
+    }
+    let range = merge_base.map(|mb| format!("{mb}..HEAD"));
+    let mut args = vec![
+        "log",
+        "--first-parent",
+        "--decorate=full",
+        "--format=%H%x00%s%x00%ct%x00%an%x00%D%x00%P",
+        "-z",
+    ];
+    match &range {
+        Some(r) => args.push(r),
+        None => args.extend(["-50", "HEAD"]),
+    }
+    let out = git(repo, &args)?;
+    Ok(parse_commit_log(&out))
+}
+
+/// Parse `git log --format=%H%x00%s%x00%ct%x00%an%x00%D%x00%P -z` output: six NUL-separated
+/// fields per commit, commits themselves NUL-terminated.
+fn parse_commit_log(out: &str) -> Vec<CommitRow> {
+    let fields: Vec<&str> = out.split('\0').collect();
+    fields
+        .chunks(6)
+        .filter(|c| c.len() == 6 && !c[0].is_empty())
+        .map(|c| CommitRow {
+            sha: c[0].to_string(),
+            subject: c[1].to_string(),
+            time: c[2].trim().parse().unwrap_or(0),
+            author: c[3].to_string(),
+            refs: parse_decorations(c[4]),
+            merge: c[5].split_whitespace().count() > 1,
+        })
+        .collect()
+}
+
+/// `%D` under `--decorate=full` as typed refs: `HEAD -> refs/heads/feature,
+/// refs/remotes/origin/feature, tag: refs/tags/v1` becomes `Remote("origin/feature")`,
+/// `Tag("v1")`. `HEAD` and the branch it is on are dropped, since the top row is `HEAD` by
+/// construction and its branch is the one being reviewed.
+fn parse_decorations(d: &str) -> Vec<CommitRef> {
+    d.split(", ")
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && *r != "HEAD" && !r.starts_with("HEAD -> "))
+        .filter_map(|r| {
+            if let Some(t) = r.strip_prefix("tag: refs/tags/") {
+                Some(CommitRef::Tag(t.to_string()))
+            } else if let Some(t) = r.strip_prefix("refs/remotes/") {
+                Some(CommitRef::Remote(t.to_string()))
+            } else {
+                r.strip_prefix("refs/heads/").map(|b| CommitRef::Branch(b.to_string()))
+            }
+        })
+        .collect()
+}
+
+/// One entry in the `All files` worktree listing: a path plus whether git ignores it and
+/// whether it is a (lazily-expanded) directory placeholder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: String,
+    pub ignored: bool,
+    pub is_dir: bool,
+}
+
+/// Every entry in the worktree for the `All files` tab: tracked and
+/// untracked-not-ignored files from one `ls-files --cached --others` pass, and the ignored
+/// entries from [`ignored_entries`] — a wholly-ignored directory collapsed to one `is_dir`
+/// placeholder, an individually-ignored file as itself. `.git` is never reported. Deduped and
+/// sorted; `-z` keeps paths with spaces or special characters verbatim.
+pub fn all_files(repo: &Path) -> Result<Vec<WorktreeEntry>> {
+    // One spawn for tracked + untracked. `--others --exclude-standard` applies the same
+    // standard exclude rules as the `status` untracked pass `changed_files` runs, so the
+    // untracked sets match without a status walk.
+    let listed = git(repo, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"])?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for path in listed.split('\0').filter(|s| !s.is_empty()) {
+        if seen.insert(path.to_string()) {
+            out.push(WorktreeEntry { path: path.to_string(), ignored: false, is_dir: false });
+        }
+    }
+    for (path, is_dir) in ignored_entries(repo)? {
+        if seen.insert(path.clone()) {
+            out.push(WorktreeEntry { path, ignored: true, is_dir });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+/// The ignored entries: a wholly-ignored directory comes back as `dir/` (mapped to
+/// `is_dir = true`), an individually-ignored file as itself.
+///
+/// `ls-files --directory` prunes at each ignored directory instead of walking inside it, where
+/// `git status --ignored` enumerates the whole tree — seconds against a large `node_modules`.
+/// `--no-empty-directory` matches `status`'s output exactly, which skips empty ignored dirs.
+fn ignored_entries(repo: &Path) -> Result<Vec<(String, bool)>> {
+    let out = git(
+        repo,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+            "-z",
+        ],
+    )?;
+    Ok(out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|path| match path.strip_suffix('/') {
+            Some(dir) => (dir.to_string(), true),
+            None => (path.to_string(), false),
+        })
+        .collect())
+}
+
+/// The immediate children of a wholly-ignored directory, for lazy expansion in `All files`
+/// Everything under an ignored directory is ignored, so this reads the
+/// filesystem directly; sub-directories come back as `is_dir` placeholders to expand in turn.
+/// An unreadable directory yields no children rather than failing the reload, so expansion is
+/// best-effort.
+pub fn list_ignored_dir(repo: &Path, dir: &str) -> Vec<WorktreeEntry> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(repo.join(dir)) else { return out };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        out.push(WorktreeEntry { path: format!("{dir}/{name}"), ignored: true, is_dir });
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Build the sorted `ChangedFile` list from `git diff` numstat + name-status output,
+/// optionally appending untracked files (which a `git diff` never reports).
+fn assemble(
+    repo: &Path,
+    numstat: &str,
+    name_status: &str,
+    include_untracked: bool,
+) -> Result<Vec<ChangedFile>> {
+    let counts = parse_numstat(numstat);
+    let mut seen = HashSet::new();
+    let mut files = Vec::new();
+    for (kind, path, previous_path) in parse_name_status(name_status) {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let (additions, deletions) = counts.get(&path).copied().unwrap_or((0, 0));
+        files.push(ChangedFile { path, kind, additions, deletions, previous_path });
+    }
+
+    if include_untracked {
+        // Untracked-not-ignored files list as additions. One `ls-files --others` pass — the
+        // same definition of untracked `all_files` uses, so the two views can't disagree.
+        // `-z` keeps paths with spaces or special characters verbatim, and files inside a
+        // brand-new directory list individually (.gitignore still applies).
+        let others = git(repo, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+        for path in others.split('\0').filter(|s| !s.is_empty()) {
+            let path = path.to_string();
+            if seen.insert(path.clone()) {
+                let additions = untracked_additions(repo, &path);
+                files.push(ChangedFile {
+                    path,
+                    kind: ChangeKind::Untracked,
+                    additions,
+                    deletions: 0,
+                    previous_path: None,
+                });
+            }
+        }
+    }
+
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// Addition count of an untracked file: its line count, which is what `git diff` against
+/// nothing reports (0 for empty or binary). Read locally rather than shelling
+/// `git diff --no-index` per file — with `--untracked-files=all` a large untracked tree
+/// would otherwise fork git once per file on every poll and freeze the UI.
+fn untracked_additions(repo: &Path, path: &str) -> u32 {
+    let Ok(bytes) = std::fs::read(repo.join(path)) else { return 0 };
+    if bytes.is_empty() || bytes.contains(&0) {
+        return 0; // empty, or binary (a NUL byte) — git reports no line additions
+    }
+    // Lines = newline count, plus one for a final line with no trailing newline. A plain
+    // byte count is fine for one already-read file; no need for the bytecount crate.
+    #[allow(clippy::naive_bytecount)]
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    let trailing = usize::from(bytes.last() != Some(&b'\n'));
+    (newlines + trailing) as u32
+}
+
+// --- pure parsers (unit-tested without a repo) ---------------------------------
+
+/// Map of new-path to `(additions, deletions)` from `git diff --numstat -z`.
+///
+/// Under `-z` a non-rename record is `ADDS\tDELS\tPATH\0`; a rename/copy record is
+/// `ADDS\tDELS\t\0OLD\0NEW\0` — the counts ride the front, then old and new arrive as
+/// their own NUL fields (no `=>` arrow, no brace factoring). Binary files emit `-`/`-`,
+/// which parse to 0. The counts key under the new path, matching `parse_name_status`.
+fn parse_numstat(out: &str) -> HashMap<String, (u32, u32)> {
+    let mut map = HashMap::new();
+    let mut it = out.split('\0');
+    while let Some(field) = it.next() {
+        // `splitn(3)` keeps any tabs inside the path (verbatim under `-z`) intact.
+        let mut parts = field.splitn(3, '\t');
+        let add = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let del = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        match parts.next() {
+            // Non-rename: the path rode this same field.
+            Some(path) if !path.is_empty() => {
+                map.insert(path.to_string(), (add, del));
+            }
+            // Rename/copy: the next two fields are the old and new paths.
+            Some(_) => {
+                let _old = it.next();
+                if let Some(new) = it.next().filter(|n| !n.is_empty()) {
+                    map.insert(new.to_string(), (add, del));
+                }
+            }
+            // No tab fields — a trailing empty record after the final NUL.
+            None => {}
+        }
+    }
+    map
+}
+
+/// `(kind, path, previous_path)` from `git diff --name-status -z`. Under `-z` each record is
+/// `STATUS\0PATH\0`, except a rename/copy is `R<score>\0OLD\0NEW\0` (status, then old and new
+/// as separate fields). A rename or copy takes the new path and carries its old path; every
+/// other kind has `previous_path == None`. Copy folds into `Renamed` — a copy's old content
+/// lives at the old path exactly like a rename, which is what `content_sides` reads.
+fn parse_name_status(out: &str) -> Vec<(ChangeKind, String, Option<String>)> {
+    let mut rows = Vec::new();
+    let mut it = out.split('\0');
+    while let Some(status) = it.next() {
+        let row = match status.chars().next() {
+            Some('A') => it.next().map(|p| (ChangeKind::Added, p.to_string(), None)),
+            Some('D') => it.next().map(|p| (ChangeKind::Deleted, p.to_string(), None)),
+            Some('R' | 'C') => {
+                let old = it.next();
+                it.next().map(|new| (ChangeKind::Renamed, new.to_string(), old.map(str::to_string)))
+            }
+            // Modified, type-changed, etc.; also skips the trailing empty record.
+            Some(_) => it.next().map(|p| (ChangeKind::Modified, p.to_string(), None)),
+            None => None,
+        };
+        if let Some((kind, path, prev)) = row
+            && !path.is_empty()
+        {
+            rows.push((kind, path, prev));
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
+        parse_name_status, parse_numstat,
+    };
+
+    const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None };
+
+    fn github(host: &str) -> ForgeHosts<'_> {
+        ForgeHosts { github: Some(host), ..NONE }
+    }
+
+    fn gitlab(host: &str) -> ForgeHosts<'_> {
+        ForgeHosts { gitlab: Some(host), ..NONE }
+    }
+
+    #[test]
+    fn worktree_of_distinguishes_a_repo_from_a_plain_directory() {
+        use super::{Worktree, worktree_of};
+        // A plain directory git can read but that holds no worktree.
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(worktree_of(outside.path()), Worktree::Outside);
+        // A real worktree resolves to its root. Compare against std canonicalization, an oracle
+        // independent of `worktree_of` (both git and std resolve the temp dir's symlinks).
+        let repo = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let canonical = std::fs::canonicalize(repo.path()).unwrap();
+        assert_eq!(worktree_of(repo.path()), Worktree::Root(canonical));
+    }
+
+    #[test]
+    fn repository_identity_parses_github_and_enterprise_remote_forms() {
+        let repo = |host: &str, owner: &str, name: &str| {
+            RepositoryIdentity::Repository(RepoTarget::new(host, owner, name).unwrap())
+        };
+        // HTTPS, with and without `.git` and a trailing slash.
+        assert_eq!(
+            classify_remote("https://github.com/owner/repo.git", &NONE),
+            repo("github.com", "owner", "repo")
+        );
+        assert_eq!(
+            classify_remote("https://github.com/owner/repo", &NONE),
+            repo("github.com", "owner", "repo")
+        );
+        assert_eq!(
+            classify_remote("https://github.com/owner/repo/", &NONE),
+            repo("github.com", "owner", "repo")
+        );
+        // scp-like SSH, and the `ssh://` scheme form with a port.
+        assert_eq!(
+            classify_remote("git@github.com:owner/repo.git", &NONE),
+            repo("github.com", "owner", "repo")
+        );
+        assert_eq!(
+            classify_remote("ssh://git@github.com/owner/repo.git", &NONE),
+            repo("github.com", "owner", "repo")
+        );
+        assert_eq!(
+            classify_remote("ssh://git@github.com:22/owner/repo.git", &NONE),
+            repo("github.com", "owner", "repo")
+        );
+        assert_eq!(
+            classify_remote("git://github.com/owner/repo", &NONE),
+            repo("github.com", "owner", "repo")
+        );
+        assert_eq!(
+            classify_remote(
+                "https://github.company.com/owner/repo.git",
+                &github("github.company.com")
+            ),
+            repo("github.company.com", "owner", "repo")
+        );
+    }
+
+    #[test]
+    fn repository_identity_parses_gitlab_remote_forms() {
+        let repo = |host: &str, segments: &[&str]| {
+            RepositoryIdentity::Repository(
+                RepoTarget::with_path(Forge::GitLab, host, segments).unwrap(),
+            )
+        };
+        assert_eq!(
+            classify_remote("https://gitlab.com/owner/repo.git", &NONE),
+            repo("gitlab.com", &["owner", "repo"])
+        );
+        assert_eq!(
+            classify_remote("git@gitlab.com:owner/repo.git", &NONE),
+            repo("gitlab.com", &["owner", "repo"])
+        );
+        // Nested groups keep the full namespace path.
+        assert_eq!(
+            classify_remote("https://gitlab.com/group/subgroup/project.git", &NONE),
+            repo("gitlab.com", &["group", "subgroup", "project"])
+        );
+        assert_eq!(
+            classify_remote("git@git.corp.example:team/sub/repo.git", &gitlab("git.corp.example")),
+            repo("git.corp.example", &["team", "sub", "repo"])
+        );
+        // A GitHub target and a GitLab target on the same path are different targets.
+        let RepositoryIdentity::Repository(on_github) =
+            classify_remote("https://github.com/owner/repo", &NONE)
+        else {
+            panic!("expected a repository identity");
+        };
+        let RepositoryIdentity::Repository(on_gitlab) =
+            classify_remote("https://gitlab.com/owner/repo", &NONE)
+        else {
+            panic!("expected a repository identity");
+        };
+        assert_ne!(on_github, on_gitlab);
+        assert_eq!(on_github.forge(), Forge::GitHub);
+        assert_eq!(on_gitlab.forge(), Forge::GitLab);
+        // A single-segment GitLab path is malformed, not unsupported.
+        assert_eq!(
+            classify_remote("https://gitlab.com/owner", &NONE),
+            RepositoryIdentity::Malformed("gitlab.com".to_string())
+        );
+    }
+
+    #[test]
+    fn repository_identity_rejects_aliases_and_keeps_failure_states_distinct() {
+        assert_eq!(
+            classify_remote("git@github.com-work:owner/repo.git", &NONE),
+            RepositoryIdentity::Unsupported("github.com-work".to_string())
+        );
+        assert_eq!(
+            classify_remote(
+                "git@github.company.com-work:owner/repo.git",
+                &github("github.company.com")
+            ),
+            RepositoryIdentity::Unsupported("github.company.com-work".to_string())
+        );
+        assert_eq!(
+            classify_remote("https://github.com-attacker/owner/repo", &NONE),
+            RepositoryIdentity::Unsupported("github.com-attacker".to_string())
+        );
+        assert_eq!(
+            classify_remote(
+                "https://github.company.com-work/owner/repo",
+                &github("github.company.com")
+            ),
+            RepositoryIdentity::Unsupported("github.company.com-work".to_string())
+        );
+        assert_eq!(
+            classify_remote("git@gitlab.com-work:owner/repo.git", &NONE),
+            RepositoryIdentity::Unsupported("gitlab.com-work".to_string())
+        );
+        assert_eq!(
+            classify_remote("https://bitbucket.org/owner/repo", &NONE),
+            RepositoryIdentity::Unsupported("bitbucket.org".to_string())
+        );
+        assert_eq!(
+            classify_remote("https://github.com/owner", &NONE),
+            RepositoryIdentity::Malformed("github.com".to_string())
+        );
+        assert_eq!(
+            classify_remote("https://github.com", &NONE),
+            RepositoryIdentity::Malformed("github.com".to_string())
+        );
+        assert_eq!(
+            classify_remote(
+                "https://github.company.com:8443/owner/repo.git",
+                &github("github.company.com")
+            ),
+            RepositoryIdentity::Unsupported("github.company.com".to_string())
+        );
+        assert_eq!(classify_remote("/tmp/repo", &NONE), RepositoryIdentity::Hostless);
+        assert_eq!(classify_remote("file:///tmp/repo", &NONE), RepositoryIdentity::Hostless);
+        assert_eq!(
+            classify_remote("file://github.com/owner/repo", &NONE),
+            RepositoryIdentity::Unsupported("github.com".to_string())
+        );
+        assert_eq!(
+            classify_remote("ftp://github.com/owner/repo", &NONE),
+            RepositoryIdentity::Unsupported("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn repository_target_enforces_its_canonical_shape() {
+        let target = RepoTarget::new("GitHub.COM", "owner", "repo").unwrap();
+        assert_eq!(target.host(), "github.com");
+        assert_eq!(target.owner(), "owner");
+        assert_eq!(target.name(), "repo");
+        assert!(RepoTarget::new("bad host", "owner", "repo").is_none());
+        assert!(RepoTarget::new("github.com", ".", "repo").is_none());
+        assert!(RepoTarget::new("github.com", "owner/name", "repo").is_none());
+        assert!(RepoTarget::new("github.com", "owner", "bad\nname").is_none());
+        assert!(RepoTarget::new("github.com", "owner", "bad\u{202e}name").is_none());
+        // A GitHub path is exactly two segments; a GitLab path is two or more.
+        assert!(RepoTarget::with_path(Forge::GitHub, "github.com", &["a", "b", "c"]).is_none());
+        let nested =
+            RepoTarget::with_path(Forge::GitLab, "gitlab.com", &["group", "sub", "repo"]).unwrap();
+        assert_eq!(nested.full_path(), "group/sub/repo");
+        assert_eq!(nested.name(), "repo");
+        assert!(RepoTarget::with_path(Forge::GitLab, "gitlab.com", &["only"]).is_none());
+    }
+
+    #[test]
+    fn numstat_parses_counts_and_ignores_binary() {
+        let m = parse_numstat("18\t8\tsrc/a.rs\0-\t-\tassets/logo.png\0");
+        assert_eq!(m["src/a.rs"], (18, 8));
+        assert_eq!(m["assets/logo.png"], (0, 0));
+    }
+
+    #[test]
+    fn numstat_keys_renames_under_the_new_path() {
+        // Under `-z` a rename is `ADDS\tDELS\t\0OLD\0NEW`: old and new are their own fields,
+        // no `=>` arrow or brace form. Counts must key under the new path.
+        let m = parse_numstat("3\t1\t\0src/old.rs\0src/new.rs\0");
+        assert_eq!(m["src/new.rs"], (3, 1));
+        assert!(!m.contains_key("src/old.rs"));
+    }
+
+    #[test]
+    fn numstat_dir_removing_rename_has_no_double_slash() {
+        // Regression: the old brace parser produced `a//file.rs` here, so counts never matched.
+        let m = parse_numstat("4\t2\t\0a/b/file.rs\0a/file.rs\0");
+        assert_eq!(m["a/file.rs"], (4, 2));
+        assert!(!m.contains_key("a//file.rs"));
+    }
+
+    #[test]
+    fn numstat_handles_a_mixed_stream() {
+        // binary, plain, rename, in sequence — the rename lookahead must stay aligned.
+        // `\x00` (= NUL) is used as the separator so the digits after it read clearly.
+        let m = parse_numstat("-\t-\tlogo.png\x009\t1\tsrc/a.rs\x005\t4\t\x00o.rs\x00n.rs\x00");
+        assert_eq!(m["logo.png"], (0, 0));
+        assert_eq!(m["src/a.rs"], (9, 1));
+        assert_eq!(m["n.rs"], (5, 4));
+    }
+
+    #[test]
+    fn name_status_kinds_and_rename_target() {
+        let rows =
+            parse_name_status("M\0src/a.rs\0A\0src/b.rs\0D\0src/c.rs\0R100\0old.rs\0new.rs\0");
+        assert_eq!(rows[0], (ChangeKind::Modified, "src/a.rs".to_string(), None));
+        assert_eq!(rows[1], (ChangeKind::Added, "src/b.rs".to_string(), None));
+        assert_eq!(rows[2], (ChangeKind::Deleted, "src/c.rs".to_string(), None));
+        assert_eq!(
+            rows[3],
+            (ChangeKind::Renamed, "new.rs".to_string(), Some("old.rs".to_string()))
+        );
+    }
+
+    #[test]
+    fn name_status_copy_keeps_the_new_path() {
+        // A copy carries old + new like a rename; it must key under the new path, not collapse
+        // to a Modified entry on the source path.
+        let rows = parse_name_status("C75\0orig.rs\0copy.rs\0");
+        assert_eq!(
+            rows[0],
+            (ChangeKind::Renamed, "copy.rs".to_string(), Some("orig.rs".to_string()))
+        );
+    }
+}

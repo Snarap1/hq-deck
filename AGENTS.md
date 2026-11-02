@@ -1,0 +1,132 @@
+# AGENTS.md
+
+hq-deck is a Rust TUI (ratatui) review and source-control tool for one git worktree.
+It runs in a terminal beside a coding agent, shows the worktree's diff, and takes line comments.
+It sends the comments to the agent through herdr-core's `hc send`, or copies them to the clipboard.
+It stages, commits, and runs git operations on the same worktree.
+One binary, one git worktree per process (`hq-deck [repo]`).
+
+## Ground rules
+
+- Linux only.
+  Do not add macOS or Windows branches.
+- No release binaries, no publishing pipeline, no CI.
+  `cargo install --path .` (`just install`) is the whole distribution story, and `just ci` is the whole check.
+- No herdr dependency: no plugin manifest, no pane actions, no `herdr` CLI calls.
+  herdr-core (`hc`) is a different product and is the agent transport; `src/agent.rs` reaches it only through its CLI.
+- There is no upstream sync.
+
+## Commands
+
+- `just test` - full test suite.
+  Single test: `cargo test <name>`; integration tests live in `tests/`: `cargo test --test app_flow <name>`.
+- `just lint` - clippy with warnings as errors.
+  `just fmt` / `just fmt-check` - rustfmt.
+- `just ci` - fmt-check, lint, test, release build.
+  Run it before calling a change done.
+- `just install` - `cargo install --path . --locked` into `~/.cargo/bin/hq-deck`.
+  Cargo replaces the binary through a fresh inode, so a running hq-deck keeps the old image until restarted.
+- `just smoke-edit` - PTY smoke test of the editor path (`e`) against a real release binary.
+  Unit tests stop at the argv, so run it after any change to `run_editor`, the terminal mode stack, or the editor dialects.
+  It is not part of `just ci` and takes about a minute.
+  Run it detached: `setsid python3 scripts/smoke_edit_file.py --binary target/release/hq-deck < /dev/null`.
+  crossterm sizes the pane from `/dev/tty`, so inside a short pane the below-the-fold checks fail for no reason of the code's.
+  The same caveat applies to `scripts/bench_tui.py`.
+- `python3 scripts/bench_tui.py --binary target/release/hq-deck --fixture` - perceived-latency benchmark (keypress to painted frame, via PTY), the acceptance instrument.
+  `cargo run --release --example bench_latency -- <repo>` attributes a slow number to its component calls.
+  The one committed baseline is `scripts/bench-results/baseline.json`; replace it when a change moves the numbers, never add per-round runs.
+  Run before and after any change to the reload, render, git, or highlight paths.
+  Compare medians A/B under the same load: build the old binary to a second target dir and interleave runs.
+
+## Invariants
+
+Load-bearing. Cite them by name.
+
+- **Writes are asked for**: every mutation of the repository is the direct result of a keystroke that named it.
+  The places that make them are `Changes`' SCM mode (stage, unstage, discard, commit, and the `.` menu's checkout/stash/tag/branch/worktree entries) and `GitOps` (pull/push/fetch/merge/rebase).
+  Destructive ones confirm first.
+  Everywhere else deck reads: the diff, `All files`, search, preview, and the `PR` tab (which never posts to a forge) mutate nothing.
+  No path mutates on a poll, a refresh, or a fetch landing.
+  The only other git writes are two worktree-private refs, `refs/worktree/reviewr/{base-pick,turn-base}`, written by `B`'s pick and `M`'s mark.
+  The namespace keeps its old spelling so existing worktrees keep their pick.
+  The boundary must not drift further without an explicit decision.
+- **Comments survive**: comments are never lost to a refresh or the agent's edits, and leave only by an explicit successful export (`s` send, `y` copy).
+  The comment store is in-memory by design - do not propose persisting it.
+- **Continuity**: place state (cursor, scroll, tab, scope, folds, selection, layout) moves only under the user's own input.
+  World events (polls, refreshes, fetch results) may only reconcile it: match by identity first (path, comment author+anchor, never row index), fall back to the nearest surviving target, clamp last.
+  Derived state on screen may be stale, never wrong: blank a view only when its identity changed, never because the same thing gained newer content.
+
+## Architecture
+
+The runtime is a single-threaded frame loop (`event_loop` in `src/lib.rs`): draw, wait for input or a poll deadline, mutate `App`, draw.
+Clipboard, agent send, per-file diff builds, and the SCM-mode/`GitOps` status reads run synchronously between frames.
+A terminal editor holds the loop for its whole session by design (`policies/ux-responsiveness.md`).
+
+Seven things run on worker threads: the world worker (`src/world.rs`), the search worker (`src/search.rs`, fff-search with its own scan, watch, and content-index threads), the PR input probe, the PR forge fetch (`gh`/`glab`), config recovery, the commit-message generator (`src/commit_msg.rs`), and one git operation at a time (`src/git/ops.rs`).
+The last two share a shape: `App` holds a pending flag (`scm_suggesting`, `gitops.running`, `gitops_dispatch`) and the `mpsc::Receiver` lives as a local in `event_loop`, because `App` derives `Debug` and a receiver does not.
+World results land through `land_world_completion`: input-tagged, latest-wins, reconciled only while the view still matches.
+
+### Modules
+
+- `src/app.rs` - the `App` state machine.
+  Tabs: `Changes`/`AllFiles`/`Pr`/`GitOps`; `Changes` has a second navigator face, SCM mode (`scm_open` holds the scope it left, `scm_active()` is the one test).
+  Scopes: `Uncommitted`/`Branch`/`LastTurn`/`Commits`.
+  `Focus` is files vs diff pane.
+  `Mode` is `Normal`, the `Composing`/`List`/`BasePick`/`CommitPick` overlays, the `Find` band, and the body-replacing `Search` screen.
+  The SCM-mode and `GitOps` overlays are deliberately not `Mode` variants; they are fields on their tab's panel.
+  `reconcile_world()` is the one place a world snapshot touches place state.
+  `reload()` is the synchronous build+reconcile pair used at startup, first tab visits, and scope switches.
+  Each file tab stashes its full place state on switch-away (`swap_active_with_stash`); `Pr`, SCM mode, and `GitOps` own their state outside that stash.
+  While composing, the open diff is frozen (reconcile skips it) so a draft's anchor cannot move.
+  `GitOpsPanel` lives here: five actions, a picker, one confirm.
+- `src/lib.rs` - the frame loop and all key/mouse dispatch.
+  `Pr`, SCM mode, and `GitOps` each run their own key block (overlays first, then the tab's list) instead of growing `Mode`.
+  `switch_tab` is the one place a tab key is honored, so the tab row works from inside those blocks too.
+- `src/keymap.rs` - the rebindable action table (`ACTIONS`: action, config name, default keys) and `[keybindings]` resolution.
+  A new action is a row there plus its dispatch arm in `lib.rs`.
+- `src/world.rs` - the world worker: the pure snapshot build (`WorldInput` -> `WorldSnapshot`) and latest-wins request/completion channels.
+  Each build rereads the `last-turn` mark from its ref, like the base pick.
+- `src/git/` - every git subprocess, behind one module (`mod.rs` owns the runners and re-exports `scope::*`, so callers say `crate::git::...`).
+  - `scope.rs` - the review scopes: `changed_files`, `all_files`, `snapshot_worktree` (temp-index `add -A` + `write-tree` for the `M` mark), baseline refs.
+    `all_files` is tracked + untracked + ignored via `ls-files`; never use `git status --ignored`, it walks inside ignored trees and costs seconds.
+  - `porcelain.rs` - the staging layer: the `--porcelain=v1 -b` status parse (ahead/behind/upstream, conflict marker), stage/unstage/discard/commit, `diff_for_message`.
+  - `drawers.rs` - the read-only lists behind the SCM drawers (graph, commits, branches, remotes, stashes, tags, worktrees).
+  - `ops.rs` - the `Git ops` table (update/push/fetch-all/merge/rebase) as an argv builder plus a background `spawn`.
+  - No `ratatui` in `porcelain.rs`, `drawers.rs`, or `ops.rs`.
+- `src/scm_panel.rs` - SCM mode's whole state: Staged/Changes sections, the commit box's char-indexed buffer, the seven drawers, the context menu, the pending confirm.
+  `App` holds one field (`scm`) and delegating methods; keep SCM state here, not in `app.rs`.
+- `src/commit_msg.rs` - the ✧ generator: `spawn(repo, config)` reads the staged diff and runs `claude -p` on a worker thread.
+  Any failure returns a filename summary rather than an error.
+- `src/commit_template.rs` - the branch template (`branch_pattern` + `template`): validated at config load, rendered around the generator's summary line when the branch matches.
+  Pure.
+- `src/icons.rs` - the file-type and status glyphs the SCM navigator paints.
+- `src/diff.rs` - `FileDiff` build (syntect highlight both sides, similar-line pairing, word emphasis, folds) and `DiffCache`, keyed by path and gated by content hash.
+  Cleared on scope switch and theme change.
+- `src/ui.rs` - all rendering, including the SCM navigator (`render_scm_panel`, its overlay, `hit_scm_row`), the `Git ops` panel, and the footer.
+  Row heights and wrapping recompute per frame across the visible diff, so render cost scales with open-file size.
+  A body narrower than 60 columns drops the read pane and gives the SCM navigator the whole width.
+  The footer's row 1 has room for one comment action (`s send N`); `tests/render.rs` pins that it never drops at narrow widths.
+- `src/forge.rs` + the `PrRefresh`/`PrCoordinator` state machines in `lib.rs` - the PR snapshot.
+  Fetches are tagged with the input that produced them (repository identity, pinned HEAD and base, the branch's forge names), and a result paints only if a fresh probe proves the input still matches.
+  This generation/input-tag pattern is the template for moving other derived state off-thread.
+- `src/gitlab.rs` - the `glab` provider behind the forge boundary, mapping its payloads onto the one `PrSnapshot` shape.
+  GitHub and GitLab are the only forges.
+- `src/model.rs` - `CommentStore` (in-memory) and comment anchoring.
+  `diff_anchored` separates diff comments from content comments; each renders only in its own view.
+  A diff row (`Changes`, file tree or SCM mode, which pins the `uncommitted` scope) makes a diff comment.
+  The File view and the markdown preview paint current worktree content, so they make content comments.
+  Staging changes neither: the `uncommitted` diff is `HEAD` vs the worktree, which a stage does not move.
+- `src/editor.rs` - the editor command: a name-keyed dialect table, quote-aware splitting, and the `editor` key's `{file}`/`{line}` template.
+  Pure argv resolution; `run_editor` in `lib.rs` owns the spawn and hands the pane over for a terminal editor.
+- `src/export.rs` - comment formatting (`format_all`) and the `ExportTarget` trait, plus the clipboard target (`wl-copy`/`xclip`/`xsel`).
+  `App::export` consumes comments only on `Ok`.
+- `src/agent.rs` - the `send` target over herdr-core.
+  It picks the agent from `hc ls --json`: live, local (no `machine/` prefix), reporting status (OSC 7501, hc's only notion of an agent), not hq-deck's own terminal (`$HC_TERMINAL_ID`), with `cwd` at or under the worktree.
+  Several candidates narrow to the one in hq-deck's own `where` tab; still several is refused by name.
+  It types with `hc send` without `--force`, so a blocked agent is never typed into.
+  The pick is recomputed per send, never cached.
+  Parse and pick are pure and unit-tested.
+- `src/config.rs` - config (`$HQ_DECK_CONFIG_DIR`, else `~/.config/hq-deck/config.toml`): the whole file validates before every frame and action.
+  An invalid config blocks review work until recovery, which carries authored state.
+  A repo's `.hq-deck.toml` merges over `[commit_message]` per key; it is read on demand, outside the per-frame recovery gate, so a typo there cannot block review.
+- `src/proc.rs` - locating external tools: `command` for hq-deck's own tools (host bins first), `user_command` for the reviewer's.

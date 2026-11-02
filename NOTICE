@@ -1,0 +1,14 @@
+hq-deck (split from herdr-deck)
+Copyright (c) 2026 Pavel Naibich
+
+This product is a hard fork that merges two upstream projects. Both are MIT licensed,
+and their license texts are reproduced in LICENSE.
+
+1. herdr-reviewr — https://github.com/persiyanov/herdr-reviewr
+   Copyright (c) 2026 Dmitry Persiyanov
+   The review pane this fork is built on: diff rendering, comments, export, PR tab.
+
+2. herdr-sidebar — https://github.com/alexarthurs/herdr-sidebar
+   Copyright (c) 2026 Alex Arthurs
+   The source-control panel this fork ports: git porcelain, staging, commit box,
+   drawers, commit-message suggestion, file-type icons.
