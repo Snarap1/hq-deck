@@ -40,3 +40,7 @@ smoke-edit:
 # the full check: fmt-check, lint, test, release build
 ci: fmt-check lint test
     cargo build --release
+
+# install the herdr-app mod and its key (super-y opens hq-deck in a pane to the right)
+install-herdr:
+    scripts/install_herdr.sh

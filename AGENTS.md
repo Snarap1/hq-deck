@@ -12,8 +12,9 @@ One binary, one git worktree per process (`hq-deck [repo]`).
   Do not add macOS or Windows branches.
 - No release binaries, no publishing pipeline, no CI.
   `cargo install --path .` (`just install`) is the whole distribution story, and `just ci` is the whole check.
-- No herdr dependency: no plugin manifest, no pane actions, no `herdr` CLI calls.
-  herdr-core (`hc`) is a different product and is the agent transport; `src/agent.rs` reaches it only through its CLI.
+- The binary has no herdr-app dependency: it never calls `herdr-app` and works in any terminal.
+  herdr-core (`hc`) is the agent transport; `src/agent.rs` reaches it only through its CLI.
+  The herdr-app integration lives outside the binary, in `integrations/herdr/` (a mod plus its key), installed by `just install-herdr`.
 - There is no upstream sync.
 
 ## Commands
@@ -26,6 +27,8 @@ One binary, one git worktree per process (`hq-deck [repo]`).
   Run it before calling a change done.
 - `just install` - `cargo install --path . --locked` into `~/.cargo/bin/hq-deck`.
   Cargo replaces the binary through a fresh inode, so a running hq-deck keeps the old image until restarted.
+- `just install-herdr` - copies `integrations/herdr/mods/hq-deck` into `~/.config/herdr-app/mods` and merges `integrations/herdr/keys.json` into the user's `keys.json`.
+  It refuses to replace a key already bound to something else.
 - `just smoke-edit` - PTY smoke test of the editor path (`e`) against a real release binary.
   Unit tests stop at the argv, so run it after any change to `run_editor`, the terminal mode stack, or the editor dialects.
   It is not part of `just ci` and takes about a minute.

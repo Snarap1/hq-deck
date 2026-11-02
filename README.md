@@ -57,6 +57,17 @@ hq-deck ~/some/repo
 
 **To update**, pull and install again; a running hq-deck keeps the old binary until you restart it.
 
+### In Herdr
+
+In [Herdr](https://github.com/herdrdev/herdr-app), one key opens hq-deck in a pane to the right of the focused one, on that terminal's worktree:
+
+```bash
+just install-herdr
+```
+
+It installs the `hq-deck` mod into `~/.config/herdr-app/mods` and binds `super-y` to it (needs `jq`).
+It will not replace a key you already use; change the key in `integrations/herdr/keys.json` and run it again.
+
 ## Quick start
 
 Run hq-deck in a terminal split next to your agent:
