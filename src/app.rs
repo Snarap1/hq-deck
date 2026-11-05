@@ -691,6 +691,7 @@ pub enum FooterAction {
     /// scope already showing would offer a no-op there.
     ScopeOther,
     OpenPr,
+    CopyPrUrl,
     Refresh,
     Tabs,
     Quit,
@@ -2974,6 +2975,17 @@ impl App {
         }
     }
 
+    /// Copy the pull request's URL. A read like `pr_open`: nothing reaches the forge.
+    pub fn pr_copy_url(&mut self, target: &dyn ExportTarget) {
+        let Some(url) = self.pr_snapshot().map(|s| s.url.clone()) else {
+            return;
+        };
+        self.status = match target.export(&url) {
+            Ok(()) => format!("copied {} url", self.pr_forge.abbr()),
+            Err(_) => target.failure_message(),
+        };
+    }
+
     /// Exchange the active per-tab fields with the inactive tab's saved snapshot. Every per-tab
     /// field on `App` must be swapped here — a new per-tab field left out silently bleeds one
     /// tab's selection or scroll into the other.
@@ -4803,6 +4815,7 @@ impl App {
             let mut out = Vec::new();
             if self.pr_snapshot().is_some() {
                 out.push((A::OpenPr, Primary));
+                out.push((A::CopyPrUrl, Do));
             }
             out.push((A::Search, Go));
             out.push((A::TogglePane, Go));
@@ -4851,6 +4864,9 @@ impl App {
             // The commit box takes focus only with something staged (`scm_focus_message`).
             if !self.scm.status.staged.is_empty() {
                 out.push((A::ScmMessage, Do));
+            }
+            if self.previewable() {
+                out.push((A::Preview, Do));
             }
             out.extend([
                 (A::ScmToggle, Go),

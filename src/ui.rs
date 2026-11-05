@@ -3190,6 +3190,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         // `enter` opens the highlight in every list: a search result, a base, a commit run.
         A::OpenResult | A::PickBaseRow => ("enter".into(), "open"),
         A::OpenPr => (hint(K::OpenPr), "open ↗"),
+        A::CopyPrUrl => (hint(K::Copy), "copy url"),
         A::Refresh => (hint(K::Refresh), "refresh"),
         A::Tabs => (
             format!(

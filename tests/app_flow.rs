@@ -1012,6 +1012,65 @@ fn the_pr_footer_offers_open_for_any_resolved_pr() {
 }
 
 #[test]
+fn the_pr_tab_copies_the_url_of_a_resolved_pr_only() {
+    use hq_deck::app::Tab;
+    use hq_deck::forge::{PrSnapshot, PrView};
+
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    app.set_tab(Tab::Pr).unwrap();
+    let offered = |app: &App| app.footer_bands().iter().any(|&(a, _)| a == FooterAction::CopyPrUrl);
+
+    // No resolved PR: nothing offered, nothing copied.
+    let target = FakeTarget::ok();
+    assert!(!offered(&app));
+    app.pr_copy_url(&target);
+    assert!(target.captured.borrow().is_empty());
+
+    let url = "https://example.test/pull/7".to_string();
+    app.pr = PrView::Pr(Box::new(PrSnapshot { url: url.clone(), ..common::pr_snapshot() }));
+    assert!(offered(&app));
+    app.pr_copy_url(&target);
+    assert_eq!(target.last(), url);
+    assert!(app.status.starts_with("copied"), "{}", app.status);
+
+    app.pr_copy_url(&FakeTarget::failing());
+    assert_eq!(app.status, "fake not found");
+}
+
+#[test]
+fn m_previews_a_markdown_file_from_scm_mode_and_page_keys_scroll_it() {
+    let r = Repo::init();
+    r.write("a.md", "# one\n");
+    r.write("b.md", "# two\n");
+    r.commit_all("init");
+    let long = "paragraph\n\n".repeat(200);
+    r.write("a.md", &long);
+    r.write("b.md", &long);
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+    press(&mut app, &keymap, KeyCode::Char('x'));
+    while app.diff_path.as_deref() != Some("a.md") {
+        press(&mut app, &keymap, KeyCode::Char('j'));
+    }
+    let offered = |app: &App| app.footer_bands().iter().any(|&(a, _)| a == FooterAction::Preview);
+    assert!(offered(&app), "a markdown file offers the preview");
+
+    press(&mut app, &keymap, KeyCode::Char('m'));
+    assert!(app.scm_active() && app.preview_active());
+
+    // The page keys read the preview and leave the list's cursor alone.
+    let selected = app.scm.selected_file().map(|e| e.path.clone());
+    press(&mut app, &keymap, KeyCode::PageDown);
+    assert!(app.preview_scroll > 0);
+    assert_eq!(app.scm.selected_file().map(|e| e.path.clone()), selected);
+
+    press(&mut app, &keymap, KeyCode::Char('m'));
+    assert!(!app.preview_active(), "m returns to the diff");
+    assert!(app.scm_active());
+}
+
+#[test]
 fn the_footer_offers_send_only_once_a_comment_exists() {
     let mut app = composing_app();
     app.cancel_comment();

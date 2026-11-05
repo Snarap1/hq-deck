@@ -151,6 +151,7 @@ jumps, and `Ctrl+W` / `Ctrl+U` / `Ctrl+K` deletes.
 | `j` `k` | Move through description and comments |
 | `PageUp` `PageDown` | Scroll focused pane |
 | `o` | Open PR in browser |
+| `y` | Copy PR URL |
 | `r` | Refresh |
 
 **Changes in SCM mode** (`x`)
@@ -160,6 +161,7 @@ jumps, and `Ctrl+W` / `Ctrl+U` / `Ctrl+K` deletes.
 | `j` `k` | Move — the file under the cursor opens its diff in the read pane |
 | `Enter` | Stage or unstage the file; collapse a section or drawer header |
 | `a` `U` | Stage all / unstage all |
+| `m` | Preview markdown file; `PageUp` `PageDown` scroll it |
 | `.` | Context menu for the row (discard, copy path, checkout, stash, tag…) |
 | `c` | Focus the commit box (once something is staged) — on an empty box, also generate a message with ✧ |
 | `Enter` (commit box) | Commit the staged files |

@@ -1800,6 +1800,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
                 app.refresh_commanded = true;
             }
             (Some(K::OpenPr), _) => app.pr_open(),
+            (Some(K::Copy), _) => app.pr_copy_url(&Clipboard),
             (Some(K::Search), _) => app.open_search(),
             (Some(K::NavigatorPosition), _) => app.cycle_navigator_position(),
             (Some(K::NavigatorGrow), _) => app.resize_navigator(4),
@@ -1881,12 +1882,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             }
             (Some(K::Down), _) => app.scm_move(1),
             (Some(K::Up), _) => app.scm_move(-1),
+            // `j`/`k` stay on the list; the page keys are the keyboard's way to read a preview.
+            (Some(K::PageDown), _) if app.preview_active() => app.preview_scroll_by(PAGE),
+            (Some(K::PageUp), _) if app.preview_active() => app.preview_scroll_by(-PAGE),
             (Some(K::PageDown), _) => app.scm_move(PAGE),
             (Some(K::PageUp), _) => app.scm_move(-PAGE),
             (Some(K::ScmStageAll), _) => app.scm_stage_all()?,
             (Some(K::ScmUnstageAll), _) => app.scm_unstage_all()?,
             (Some(K::ScmMenu), _) => app.scm_open_menu(),
             (Some(K::ScmToggle), _) => app.toggle_scm()?,
+            (Some(K::Preview), _) => app.toggle_preview(),
             (Some(K::Comment), _) => app.scm_focus_message(),
             // The search screen is reachable from every tab, and the bar says so here too.
             (Some(K::Search), _) => app.open_search(),
