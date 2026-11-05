@@ -1949,7 +1949,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             (Some(K::Down), _) => app.list_move(1),
             (Some(K::Up), _) => app.list_move(-1),
             (Some(K::Send), _) => {
-                app.export(&crate::agent::HcAgent::from_env(&app.repo));
+                app.export(&crate::agent::Agent::from_env(&app.repo));
             }
             (Some(K::Copy), _) => {
                 app.export(&Clipboard);
@@ -2022,7 +2022,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
             K::CopyPath => app.copy_file_path(),
             K::Send => {
-                app.export(&crate::agent::HcAgent::from_env(&app.repo));
+                app.export(&crate::agent::Agent::from_env(&app.repo));
             }
             K::Copy => {
                 app.export(&Clipboard);

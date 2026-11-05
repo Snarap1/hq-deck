@@ -13,8 +13,8 @@ One binary, one git worktree per process (`hq-deck [repo]`).
 - No release binaries, no publishing pipeline, no CI.
   `cargo install --path .` (`just install`) is the whole distribution story, and `just ci` is the whole check.
 - The binary has no herdr-app dependency: it never calls `herdr-app` and works in any terminal.
-  herdr-core (`hc`) is the agent transport; `src/agent.rs` reaches it only through its CLI.
-  The herdr-app integration lives outside the binary, in `integrations/herdr/` (a mod plus its key), installed by `just install-herdr`.
+  herdr-core (`hc`) and the older `herdr` are the agent transports; `src/agent.rs` reaches each only through its CLI.
+  The herdr-app integration lives outside the binary, in `integrations/herdr/` (a mod plus its key), and the older herdr's in `integrations/herdr-legacy/` (a plugin), both installed by `just install-herdr`.
 - There is no upstream sync.
 
 ## Commands
@@ -29,6 +29,7 @@ One binary, one git worktree per process (`hq-deck [repo]`).
   Cargo replaces the binary through a fresh inode, so a running hq-deck keeps the old image until restarted.
 - `just install-herdr` - copies `integrations/herdr/mods/hq-deck` into `~/.config/herdr-app/mods` and merges `integrations/herdr/keys.json` into the user's `keys.json`.
   It refuses to replace a key already bound to something else.
+  With `herdr` installed it also runs `herdr plugin link integrations/herdr-legacy`; either host alone is enough.
 - `just smoke-edit` - PTY smoke test of the editor path (`e`) against a real release binary.
   Unit tests stop at the argv, so run it after any change to `run_editor`, the terminal mode stack, or the editor dialects.
   It is not part of `just ci` and takes about a minute.
@@ -123,10 +124,12 @@ World results land through `land_world_completion`: input-tagged, latest-wins, r
   Pure argv resolution; `run_editor` in `lib.rs` owns the spawn and hands the pane over for a terminal editor.
 - `src/export.rs` - comment formatting (`format_all`) and the `ExportTarget` trait, plus the clipboard target (`wl-copy`/`xclip`/`xsel`).
   `App::export` consumes comments only on `Ok`.
-- `src/agent.rs` - the `send` target over herdr-core.
-  It picks the agent from `hc ls --json`: live, local (no `machine/` prefix), reporting status (OSC 7501, hc's only notion of an agent), not hq-deck's own terminal (`$HC_TERMINAL_ID`), with `cwd` at or under the worktree.
+- `src/agent.rs` - the `send` target over herdr-core or the older herdr.
+  `Host` chooses per send: `$HC_TERMINAL_ID` means `hc`, else `$HERDR_PANE_ID` means herdr, else `hc`.
+  It picks the agent from `hc ls --json` or `herdr agent list`: live, local (no `machine/` prefix), reporting status (OSC 7501, hc's only notion of an agent; herdr's list holds only agents), not hq-deck's own terminal, with `cwd` at or under the worktree.
   Several candidates narrow to the one in hq-deck's own `where` tab; still several is refused by name.
-  It types with `hc send` without `--force`, so a blocked agent is never typed into.
+  It types with `hc send` without `--force`, which submits and refuses a blocked agent.
+  Under herdr it checks for `blocked` itself, pastes with `pane send-text` (no Enter), and focuses the agent; hc has no paste without Enter.
   The pick is recomputed per send, never cached.
   Parse and pick are pure and unit-tested.
 - `src/config.rs` - config (`$HQ_DECK_CONFIG_DIR`, else `~/.config/hq-deck/config.toml`): the whole file validates before every frame and action.

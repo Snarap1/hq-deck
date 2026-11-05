@@ -1,0 +1,32 @@
+id = "snarap.hq-deck"
+name = "hq-deck"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+platforms = ["linux"]
+description = "Review agent-written diffs, comment on lines, stage changes, and run git operations from one herdr pane."
+
+# herdr runs plugin commands with a minimal PATH, so the pane runs the binary where
+# `just install` puts it. The pane's cwd is the repo under review.
+[[panes]]
+id = "pane"
+title = "hq-deck"
+placement = "split"
+command = ["sh", "-c", "exec \"$HOME/.cargo/bin/hq-deck\""]
+
+[[actions]]
+id = "toggle"
+title = "hq-deck: toggle pane"
+contexts = ["pane", "workspace"]
+command = ["bash", "pane.sh", "toggle"]
+
+[[actions]]
+id = "open"
+title = "hq-deck: open pane"
+contexts = ["pane", "workspace"]
+command = ["bash", "pane.sh", "open"]
+
+[[actions]]
+id = "close"
+title = "hq-deck: close pane"
+contexts = ["pane", "workspace"]
+command = ["bash", "pane.sh", "close"]

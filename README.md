@@ -34,7 +34,7 @@ Besides the SCM writes, hq-deck writes exactly two refs, `refs/worktree/reviewr/
 - A **truecolor** terminal with Unicode box-drawing.
 - **Linux.**
 - A **Rust toolchain** - it is installed from source.
-- **`hc`** ([herdr-core](https://github.com/herdrdev/herdr-core)) on `PATH`, with the agent running in an `hc` terminal. `s` sends comments through it.
+- For `s`, one of: **`hc`** ([herdr-core](https://github.com/herdrdev/herdr-core)) on `PATH`, with the agent running in an `hc` terminal; or hq-deck running in a pane of the older **herdr** (0.7.5 or newer).
 - A clipboard tool: `wl-copy`, `xclip`, or `xsel`. `y` and `alt+y` copy through it.
 - **`gh`** (GitHub) or **`glab`** (GitLab), authenticated. Only the **PR** tab needs one.
 - **`claude`** on `PATH`. Only the commit box's ✧ message generator needs it.
@@ -68,6 +68,9 @@ just install-herdr
 It installs the `hq-deck` mod into `~/.config/herdr-app/mods` and binds `super-y` to it (needs `jq`).
 It will not replace a key you already use; change the key in `integrations/herdr/keys.json` and run it again.
 
+The same recipe links the plugin in `integrations/herdr-legacy/` into the older `herdr` when it is installed.
+Bind its `snarap.hq-deck.toggle` action to a key in your herdr config.
+
 ## Quick start
 
 Run hq-deck in a terminal split next to your agent:
@@ -77,8 +80,9 @@ Run hq-deck in a terminal split next to your agent:
 3. **Focus the diff.** `Tab` switches panes.
 4. **Select lines.** `v`, then `j` / `k` to extend (or click or drag the gutter).
 5. **Comment.** `c`, type, `Enter`.
-6. **Send.** `s` types every comment into the agent with `hc send`.
-   The agent is the `hc` terminal that reports status and works in this worktree; with several, the one in hq-deck's own tab.
+6. **Send.** `s` types every comment into the agent.
+   Under `hc` that is `hc send`, which submits; in a herdr pane the text is pasted without Enter and the agent is focused, so you submit it.
+   The agent is the one working in this worktree; with several, the one in hq-deck's own tab.
    A blocked agent is never typed into. `y` copies them to the clipboard instead.
 7. **Keep it.** `x` flips **Changes** into SCM mode: `Enter` stages the file under the cursor, `c` focuses the commit box (on an empty box it also asks ✧ for a message), `Enter` commits.
    `x` again goes back to the file tree.
@@ -129,7 +133,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | `d` | Delete comment |
 | `n` `N` | Jump to next / previous comment |
 | `l` | List all comments |
-| `s` | Send comments to the agent (`hc send`) |
+| `s` | Send comments to the agent |
 | `y` | Copy comments to clipboard |
 | `esc` | Clear selection |
 

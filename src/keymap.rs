@@ -51,7 +51,7 @@ pub enum Action {
     CopyPath,
     /// Snapshot the worktree as the `last-turn` scope's baseline.
     MarkTurn,
-    /// Send every comment to the agent through `hc send`.
+    /// Send every comment to the agent through `hc send` or herdr.
     Send,
     Copy,
     OpenPr,
