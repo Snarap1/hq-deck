@@ -155,3 +155,15 @@ World results land through `land_world_completion`: input-tagged, latest-wins, r
   An invalid config blocks review work until recovery, which carries authored state.
   A repo's `.hq-deck.toml` merges over `[commit_message]` per key; it is read on demand, outside the per-frame recovery gate, so a typo there cannot block review.
 - `src/proc.rs` - locating external tools: `command` for hq-deck's own tools (host bins first), `user_command` for the reviewer's.
+
+## Agent skills
+
+### Issue tracker
+
+Local markdown under `.scratch/<feature-slug>/`, tracked in git; triage state is the `Status:` line of a ticket file.
+See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the root, created lazily by `/domain-modeling`.
+See `docs/agents/domain.md`.
