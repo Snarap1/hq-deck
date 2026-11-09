@@ -1,6 +1,6 @@
 # hq-deck
 
-One key opens [hq-deck](https://github.com/Snarap1/hq-deck), a review and source-control TUI, in a new pane to the right of the focused one.
+One key toggles [hq-deck](https://github.com/Snarap1/hq-deck), a review and source-control TUI, in a pane to the right of the focused one.
 It opens on the focused terminal's folder, so it reviews the worktree your agent is working in.
 Comments you write in it go back to that agent with `s` (through `hc send`).
 
@@ -16,7 +16,9 @@ The mod itself draws nothing: no panel, no sidebar entry, no popup you can see.
 ## How it behaves
 
 - `super-y` (global) splits the focused pane to the right with `hq-deck` in it, in the focused terminal's folder.
-- Each press opens another pane; it does not toggle or reuse an open one.
+- Pressed again in a tab that already holds an hq-deck pane, it closes that pane instead of opening another.
+  The pane counts as hq-deck when its terminal was started with the exact argv the mod launches (`hc ls --json` keeps it), so an `hq-deck` you started by hand is left alone.
+  Other tabs are not touched: each tab toggles its own.
 - Agent statuses (working, blocked, done, idle) are not shown by the mod.
   hq-deck itself picks the agent to send to: the live `hc` terminal that reports status and works in that worktree, preferring the one in its own tab, and never types into a blocked one.
 - Closing the pane ends hq-deck; its comments are in memory only and leave with it.
@@ -25,10 +27,10 @@ The mod itself draws nothing: no panel, no sidebar entry, no popup you can see.
 
 - `mods/hq-deck/mod.json`: `{"place": "none", "title": "hq-deck", "overlay": {"kind": "popup", "at": "top", "width": 1, "height": 1}}`.
   `place: none` keeps it out of every layout; the overlay is what `mod.open` opens.
-- `mods/hq-deck/main.js`: a `View` whose `init` calls `run("pane.split", {direction: "right", argv: ["hq-deck"]})`, then `closeOverlay(props().overlay)` on the next tick; `render` returns an empty `div()`.
+- `mods/hq-deck/main.js`: a `View` whose `init` looks up the current tab's hq-deck panes (`focused().tab`, `panes()`, and `terminals()` matched on `argv`); it closes them with `run("pane.close", {pane})` if there are any, otherwise calls `run("pane.split", {direction: "right", argv: ["sh", "-c", "... exec hq-deck"]})`; then `closeOverlay(props().overlay)` on the next tick; `render` returns an empty `div()`.
 - `keys.json`: `{"global": {"super-y": "mod.open:hq-deck"}}`.
-- Herdr functions: `run`, `closeOverlay`, `props`.
-  Commands: `pane.split`, `mod.open`.
+- Herdr functions: `run`, `closeOverlay`, `props`, `focused`, `panes`, `terminals`.
+  Commands: `pane.split`, `pane.close`, `mod.open`.
 - Program it runs: `hq-deck` from `PATH` (installed with `cargo install`, usually `~/.cargo/bin`).
   It reads the repository with `git`, and `s` runs `hc ls` and `hc send`; the PR tab runs `gh` or `glab`.
   The mod itself reads no files and reaches no network.
@@ -47,5 +49,6 @@ The mod itself draws nothing: no panel, no sidebar entry, no popup you can see.
 - `herdr-app check mods/hq-deck` passes.
 - With a terminal focused in a git repository, `super-y` adds one pane to its right running `hq-deck`, and `hc ls --json` shows one new terminal with that `cwd` and no `status`.
   `hc` does not name it after the program: its AGENT column reads `sh`.
+- A second `super-y` in the same tab closes that pane and opens none; a third opens one again.
 - On a remote machine (a focused `machine/t<n>` terminal), the new pane opens on that machine and runs its own `hq-deck`, so it must be installed there; the herdr-app machine needs only the mod and the key.
 - `herdr-app status` shows `"overlays": []` and `"errors": []` afterwards.

@@ -60,7 +60,7 @@ hq-deck ~/some/repo
 
 ### In Herdr
 
-In [Herdr](https://github.com/herdrdev/herdr-app), one key opens hq-deck in a pane to the right of the focused one, on that terminal's worktree:
+In [Herdr](https://github.com/herdrdev/herdr-app), one key opens hq-deck in a pane to the right of the focused one, on that terminal's worktree, and pressed again closes it:
 
 ```bash
 just install-herdr

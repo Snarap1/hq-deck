@@ -41,6 +41,6 @@ smoke-edit:
 ci: fmt-check lint test
     cargo build --release
 
-# install the herdr-app mod and its key (super-y opens hq-deck in a pane to the right)
+# install the herdr-app mod and its key (super-y toggles hq-deck in a pane to the right)
 install-herdr:
     scripts/install_herdr.sh
