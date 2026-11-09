@@ -153,6 +153,36 @@ impl ExportTarget for Clipboard {
     }
 }
 
+/// The clipboard tools that read the clipboard back, paired with [`CLIPBOARD_TOOLS`] in the same
+/// order, so a paste reads the clipboard a copy wrote.
+const PASTE_TOOLS: &[(&str, &[&str])] = &[
+    ("wl-paste", &["--no-newline"]),
+    ("xclip", &["-selection", "clipboard", "-o"]),
+    ("xsel", &["--clipboard", "--output"]),
+];
+
+/// The reviewer's clipboard text, for the built-in editor's `ctrl+v`. `None` where this machine's
+/// clipboard is not the reviewer's (over ssh, or with no display: OSC 52 cannot be read back), or
+/// where no tool answers with text. The first present tool that succeeds wins, so an X11 session
+/// with `wl-clipboard` installed still reads through `xclip`.
+pub fn read_clipboard() -> Option<String> {
+    if route(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty())) == Route::Terminal {
+        return None;
+    }
+    PASTE_TOOLS.iter().filter(|(cmd, _)| crate::proc::on_path(cmd)).find_map(|(cmd, args)| {
+        let out = crate::proc::command(cmd)
+            .args(*args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()
+    })
+}
+
 /// The first clipboard tool the `present` predicate accepts, preserving list order.
 fn select_tool(
     tools: &'static [(&'static str, &'static [&'static str])],

@@ -3,7 +3,9 @@
 
 Unit tests stop at the argv. Everything after it is terminal state: leaving the alternate
 screen, releasing raw mode, and rebuilding both on return. Only a real PTY shows that, so this
-drives the real binary with a scripted editor and checks the bytes on the wire.
+drives the real binary with a scripted editor (named by the `editor` config key) and checks the
+bytes on the wire. With no `editor` key, `e` opens the built-in editor inside the pane instead,
+and the last checks drive that one through the same PTY.
 
     python3 scripts/smoke_edit_file.py --binary target/release/hq-deck
 
@@ -67,8 +69,16 @@ def make_repo(root):
     return path
 
 
+def config_with_editor(value):
+    """A fresh config directory whose `editor` key is `value`, inside the run's temp home."""
+    cfg = tempfile.mkdtemp(dir=os.path.dirname(NO_CONFIG))
+    with open(os.path.join(cfg, "config.toml"), "w") as f:
+        f.write(f'editor = "{value}"\n')
+    return cfg
+
+
 def make_editor(bindir, argv_log, name, holds=0):
-    """A scripted `$EDITOR` under a real editor's name, so its dialect resolves.
+    """A scripted editor under a real editor's name, so its dialect resolves.
 
     Records its argv, writes to the file, and prints to the terminal. It lives outside the
     repository, or reviewr would list it as an untracked change and open it instead. `holds`
@@ -96,16 +106,21 @@ def make_editor(bindir, argv_log, name, holds=0):
 
 
 class Session:
-    def __init__(self, binary, repo, editor, visual=None, config_dir=None, poll=600000):
+    """One hq-deck in a PTY. `editor` becomes the `editor` config key; with neither it nor
+    `config_dir`, the session runs on an empty config and `e` opens the built-in editor.
+    `env_editor` sets `$EDITOR`, which hq-deck must ignore."""
+
+    def __init__(self, binary, repo, editor=None, config_dir=None, poll=600000, env_editor=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
         env = {**os.environ, "TERM": "xterm-256color"}
         env.pop("VISUAL", None)
         env.pop("EDITOR", None)
+        if env_editor:
+            env["EDITOR"] = env_editor
+            env["VISUAL"] = env_editor
         if editor:
-            env["EDITOR"] = editor
-        if visual:
-            env["VISUAL"] = visual
+            config_dir = config_with_editor(editor)
         # Never the machine's own: an empty directory is the missing-file default.
         env["HQ_DECK_CONFIG_DIR"] = config_dir or NO_CONFIG
         self.proc = subprocess.Popen(
@@ -345,34 +360,17 @@ def main():
         s.press("q")
         s.close()
 
-        # The `editor` config key is the documented override, and nothing else proves it
-        # reaches the spawn: the two sources below are both live, and only one may win.
-        cfg_dir = os.path.join(home, "cfg")
-        os.makedirs(cfg_dir)
+        # A template in the `editor` key reaches the spawn whole, and the environment never
+        # takes part: hq-deck reads neither `$EDITOR` nor `$VISUAL`.
         cfg_log = os.path.join(home, "argv-cfg.txt")
         env_log = os.path.join(home, "argv-env.txt")
         configured = make_editor(bindir, cfg_log, "nano")
         from_env = make_editor(bindir, env_log, "micro")
-        with open(os.path.join(cfg_dir, "config.toml"), "w") as f:
-            f.write(f'editor = "{configured} +{{line}} {{file}}"\n')
-        s = Session(binary, root, from_env, config_dir=cfg_dir)
+        s = Session(binary, root, f"{configured} +{{line}} {{file}}", env_editor=from_env)
         s.drain()
         s.press("e")
-        check("the `editor` config key outranks the environment",
-              os.path.exists(cfg_log) and not os.path.exists(env_log))
-        s.press("q")
-        s.close()
-
-        # `$VISUAL` outranks `$EDITOR`, and the two arrive at the same call as separate
-        # arguments, so only a live check catches them being transposed there.
-        visual_log = os.path.join(home, "argv-visual.txt")
-        os.remove(env_log) if os.path.exists(env_log) else None
-        visual = make_editor(bindir, visual_log, "kak")
-        s = Session(binary, root, from_env, visual=visual)
-        s.drain()
-        s.press("e")
-        check("$VISUAL outranks $EDITOR",
-              os.path.exists(visual_log) and not os.path.exists(env_log))
+        check("a template in the `editor` key reaches the spawn", os.path.exists(cfg_log))
+        check("and the environment's editor never runs", not os.path.exists(env_log))
         s.press("q")
         s.close()
 
@@ -426,7 +424,6 @@ def main():
         # Every failure path has to reach the reviewer on the frame it happened, not on the
         # next keypress. The loop draws only after an event arrives, so the run has to repaint.
         for label, ed, needle in [
-            ("no editor set", None, b"set `editor`"),
             ("a missing editor binary", "/nonexistent/nope", b"no editor at"),
             ("an editor that exits nonzero", "/usr/bin/false", b"editor exited"),
         ]:
@@ -437,6 +434,42 @@ def main():
             check(f"{label} says so on the press", needle in plain(s.seen[mark:]))
             s.press("q")
             s.close()
+
+        # With no `editor` key, `e` opens the built-in editor inside the pane: the screen never
+        # changes hands, `$EDITOR` never runs, and `ctrl+s` is the one write.
+        builtin_root = os.path.join(home, "builtin-repo")
+        os.makedirs(builtin_root)
+        builtin_file = make_repo(builtin_root)
+        ignored_log = os.path.join(home, "argv-ignored.txt")
+        ignored = make_editor(bindir, ignored_log, "vim")
+        s = Session(binary, builtin_root, env_editor=ignored)
+        s.drain()
+        mark = len(s.seen)
+        opened = s.press("e")
+        check("with no `editor` key, `e` opens the built-in editor", b"editing" in plain(opened),
+              "the title never said `editing`")
+        check("inside the pane, which never leaves the alternate screen",
+              ALT_LEAVE not in s.seen[mark:])
+        check("and `$EDITOR` never runs", not os.path.exists(ignored_log))
+        check("the terminal cursor shows at the insertion point", b"\x1b[?25h" in opened)
+        typed = s.press("Z")
+        check("a printable types into the buffer", b"Zone" in plain(typed))
+        with open(builtin_file) as f:
+            check("typing writes nothing", not f.read().startswith("Z"))
+        s.press("\x13")  # ctrl+s
+        with open(builtin_file) as f:
+            saved = f.read()
+        check("ctrl+s writes the worktree", saved == "Zone\nTWO\nthree\nfour\nfive\n",
+              f"file={saved!r}")
+        s.press("\x1b")
+        # `q` is text inside the editor, so a clean exit on it proves `esc` closed the editor.
+        s.press("q")
+        try:
+            quit_code = s.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            quit_code = None
+        check("`esc` closes the editor, so `q` quits again", quit_code == 0, f"exit={quit_code}")
+        s.close()
 
     if failures:
         print(f"\n{len(failures)} check(s) failed: {', '.join(failures)}")

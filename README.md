@@ -131,7 +131,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | --- | --- |
 | `v` | Select lines |
 | `c` | Comment on line or selection |
-| `e` | Edit the comment under the cursor, or open the file in your editor |
+| `e` | Edit the comment under the cursor, or the file (built-in editor, or your `editor`) |
 | `d` | Delete comment |
 | `n` `N` | Jump to next / previous comment |
 | `l` | List all comments |
@@ -270,7 +270,7 @@ default_scope = "uncommitted"   # uncommitted | branch | last-turn
 navigator_position = "right"    # right | bottom | left | top
 github_host = "github.com"      # one self-hosted GitHub, bare hostname
 gitlab_host = "gitlab.com"      # one self-hosted GitLab, bare hostname
-# editor = "code -g {file}:{line}"   # unset: $EDITOR, then $VISUAL
+# editor = "code -g {file}:{line}"   # unset: the built-in editor
 
 [keybindings]                   # action = [key, …]; unlisted actions keep their defaults
 comment = ["c"]
@@ -384,15 +384,41 @@ resolved: `vs HEAD~2 (a1b2c3d)`.
 `e` opens the file at the line you're on, or the navigator's selected file. On a line you have
 already commented, `e` edits the comment instead.
 
-Set `$EDITOR` (or `$VISUAL`) and hq-deck opens it at the right line. It knows vim, neovim,
-helix, emacs, nano, VS Code and its forks, Zed, Sublime Text, JetBrains, and the rest of the
-usual set.
+With no `editor` key in the config, `e` opens the built-in editor over the read pane, on any
+tab with files. From a diff it edits the worktree file at the same line, and `esc` brings the
+diff back. The keys are micro's, and every letter is text:
+
+| Key | Action |
+|-----|--------|
+| arrows, `home`/`end`, `pgup`/`pgdn` | Move (`ctrl+←/→` by word, `ctrl+home/end` to the ends) |
+| `shift` + a move, or a mouse drag | Select |
+| `ctrl+s` | Save |
+| `ctrl+z` / `ctrl+y` | Undo / redo |
+| `ctrl+c` / `ctrl+x` / `ctrl+v` | Copy / cut / paste (the line, with nothing selected) |
+| `ctrl+a`, `ctrl+d`, `ctrl+k` | Select all, duplicate the line, cut the line |
+| `tab` / `shift+tab` | Indent / dedent, in the file's own indent unit |
+| `esc` | Close, asking first about unsaved text |
+
+`ctrl+s` is the only write. If the agent changed the file since you opened it, the save asks:
+`o` overwrites, `r` reloads the disk's version, `esc` keeps editing. The title says
+`changed on disk` as soon as the poll notices, before you save. A file that is binary, not
+UTF-8, too large for the read pane, or mixes `\n` and `\r\n` line endings does not open, and the
+footer says why.
+
+Set `editor` to use your own editor instead. hq-deck does not read `$EDITOR` or `$VISUAL`, so the
+key behaves the same however the pane was started. A bare command opens at the right line: it
+knows vim, neovim, helix, emacs, nano, micro, VS Code and its forks, Zed, Sublime Text,
+JetBrains, and the rest of the usual set.
+
+```toml
+editor = "micro"
+```
 
 A terminal editor takes the pane, and hq-deck refreshes when you quit it. A window editor opens
 its own window, so the diff stays up and your save turns up in it on the next poll.
 
-Write the command yourself when you need to. `{file}` and `{line}` are hq-deck's, everything
-else is your editor's:
+Write the whole command when you need to. `{file}` and `{line}` are hq-deck's, everything else
+is your editor's:
 
 ```toml
 editor = "code -g {file}:{line}"

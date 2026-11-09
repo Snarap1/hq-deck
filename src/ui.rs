@@ -35,8 +35,17 @@ pub fn render(frame: &mut Frame, app: &App) {
     // Link hit-testing resolves against the painted frame; each frame repaints its own.
     app.clear_painted_frame();
     if let Some(error) = app.config_error() {
-        let message =
+        let mut message =
             format!("{error}\n\nFix the file to continue. The config reloads automatically.");
+        // The blocked screen's `q` still quits, so it must not take an edit without saying so.
+        if let Some(path) = app.unsaved_edit() {
+            use std::fmt::Write as _;
+            let _ = write!(
+                message,
+                "\n\n{path} has unsaved changes in the editor. They come back once the config \
+                 is fixed; `q` quits and discards them."
+            );
+        }
         frame.render_widget(
             Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: false }),
             area,
@@ -83,6 +92,10 @@ pub fn render(frame: &mut Frame, app: &App) {
     // The active text drag's highlight paints over the finished body, in the same geometry
     // the body painted.
     render_text_selection(frame, app, area);
+    // The built-in editor covers the read pane on whichever tab opened it.
+    if app.mode == Mode::Editing {
+        render_edit_pane(frame, app, area);
+    }
     // One footer band on every tab, drawn after the per-tab base so it sits on both layouts.
     render_footer(frame, app, p.status);
 
@@ -93,7 +106,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         Mode::List => Some(render_comments_list),
         Mode::BasePick => Some(render_base_picker),
         Mode::CommitPick => Some(render_commit_picker),
-        Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find => None,
+        Mode::Normal | Mode::Composing { .. } | Mode::Search | Mode::Find | Mode::Editing => None,
     };
     if let Some(render_popup) = popup {
         scrim_behind(frame, app, area);
@@ -2715,8 +2728,9 @@ pub(crate) fn rgb(c: crate::diff::Rgb) -> Color {
     Color::Rgb(c.0, c.1, c.2)
 }
 
-/// Tabs expand to this many columns.
-const TAB: usize = 4;
+/// Tabs expand to this many columns: the editor's stop, so a file lines up the same read or
+/// edited.
+const TAB: usize = crate::edit_buffer::TAB_WIDTH;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ContinuationSpaces {
@@ -2896,6 +2910,202 @@ fn cell_span(
 /// The find band at the read pane's foot: the `find` label, the query with its block caret, and
 /// the match count at the right. The single-line query scrolls horizontally to keep the caret in
 /// view.
+/// The rect the built-in editor covers: the read pane, or the whole body where SCM mode is too
+/// narrow to show one beside its navigator.
+fn edit_pane_rect(area: Rect, app: &App) -> Rect {
+    let p = panes(area, app);
+    if app.scm_active() && !scm_wide_enough(p.body) { p.body } else { p.diff }
+}
+
+/// The editor's text cells (inside the border, right of the line-number gutter) and the gutter's
+/// width. One definition for the paint and for click hit-testing, so a click lands on the cell
+/// it hit. `None` while no file is open for editing.
+pub fn edit_text_geometry(area: Rect, app: &App) -> Option<(Rect, usize)> {
+    let session = app.edit.as_ref()?;
+    let inner = Block::default().borders(Borders::ALL).inner(edit_pane_rect(area, app));
+    let gutter = (gutter_width(session.buffer.line_count()) + 1).min(inner.width as usize);
+    let text = Rect {
+        x: inner.x + gutter as u16,
+        width: inner.width.saturating_sub(gutter as u16),
+        ..inner
+    };
+    Some((text, gutter))
+}
+
+/// The built-in editor over the read pane: line numbers, the highlighted text scrolled to the
+/// session's offsets, the selection, the terminal cursor at the insertion point, and the
+/// pending question when there is one.
+fn render_edit_pane(frame: &mut Frame, app: &App, area: Rect) {
+    use crate::edit_session::Disk;
+    let Some(session) = app.edit.as_ref() else { return };
+    let Some((text, gutter)) = edit_text_geometry(area, app) else { return };
+    let p = app.palette();
+    let pane = edit_pane_rect(area, app);
+    let mut title = format!("{} · editing", session.path);
+    if session.is_dirty() {
+        title.push_str(" ●");
+    }
+    match session.disk {
+        Disk::Same => {}
+        Disk::Changed => title.push_str(" · changed on disk"),
+        Disk::Gone => title.push_str(" · removed from disk"),
+    }
+    frame.render_widget(Clear, pane);
+    frame.render_widget(bordered(&title, true, p), pane);
+
+    let buffer = &session.buffer;
+    let first = session.scroll.min(buffer.line_count());
+    let last = (first + text.height as usize).min(buffer.line_count());
+    let cursor = buffer.cursor();
+    let selection = buffer.selection();
+    let number_w = gutter.saturating_sub(1);
+    let lines: Vec<Line<'static>> = app
+        .with_edit_highlight(last, |highlight| {
+            (first..last)
+                .map(|i| {
+                    let number_style =
+                        Style::default().fg(if i == cursor.line { p.text } else { p.dim2 });
+                    let mut spans =
+                        vec![Span::styled(format!("{:>number_w$} ", i + 1), number_style)];
+                    spans.extend(edit_line_spans(
+                        &buffer.lines()[i],
+                        highlight.spans(i),
+                        i,
+                        selection,
+                        session.h_scroll,
+                        text.width as usize,
+                        p,
+                    ));
+                    Line::from(spans)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let rows = Rect { x: text.x - gutter as u16, width: text.width + gutter as u16, ..text };
+    frame.render_widget(Paragraph::new(lines), rows);
+
+    if let Some(confirm) = session.confirm {
+        render_edit_confirm(frame, app, pane, confirm);
+        return;
+    }
+    let col = buffer.display_col(cursor);
+    if (first..last).contains(&cursor.line) && col >= session.h_scroll {
+        anchor_input_cursor(frame, text, col - session.h_scroll, cursor.line - first);
+    }
+}
+
+/// One editor line as styled spans: syntax colors (or plain text before its highlight lands),
+/// tabs expanded to their stops, control characters shown as `�`, the selection filled, and
+/// the line scrolled to `h_scroll` and cut at `width` display columns. A wide character the left
+/// edge cuts through paints as a blank, so every later cell keeps its column.
+fn edit_line_spans(
+    line: &str,
+    highlight: Option<&[crate::diff::Span]>,
+    index: usize,
+    selection: Option<(crate::edit_buffer::Pos, crate::edit_buffer::Pos)>,
+    h_scroll: usize,
+    width: usize,
+    p: &Palette,
+) -> Vec<Span<'static>> {
+    use crate::edit_buffer::{Pos, char_display_width};
+    let selected = |col: usize| {
+        selection.is_some_and(|(start, end)| {
+            let at = Pos::new(index, col);
+            start <= at && at < end
+        })
+    };
+    let plain = [crate::diff::Span { text: line.to_owned(), color: (0, 0, 0) }];
+    let (pieces, plain_fg) = match highlight {
+        Some(spans) => (spans, None),
+        None => (&plain[..], Some(p.text)),
+    };
+    // (glyph, fg, selected) per display cell.
+    let mut cells: Vec<(char, Color, bool)> = Vec::new();
+    let mut col = 0;
+    let mut at = 0;
+    for piece in pieces {
+        let fg = plain_fg.unwrap_or_else(|| rgb(piece.color));
+        for ch in piece.text.chars() {
+            let w = char_display_width(ch, at);
+            let sel = selected(col);
+            let glyph = if ch == '\t' {
+                ' '
+            } else if ch.is_control() {
+                '\u{fffd}'
+            } else {
+                ch
+            };
+            cells.push((glyph, fg, sel));
+            // A tab's extra columns and a wide character's second column carry no glyph.
+            for _ in 1..w {
+                cells.push((if ch == '\t' { ' ' } else { '\0' }, fg, sel));
+            }
+            at += w;
+            col += 1;
+        }
+    }
+    // A selection running past the line's end shows on one cell after it, the line break.
+    if selection.is_some_and(|(start, end)| {
+        let eol = Pos::new(index, col);
+        start <= eol && eol < end
+    }) {
+        cells.push((' ', p.text, true));
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    for (i, &(glyph, fg, sel)) in cells.iter().enumerate().skip(h_scroll).take(width) {
+        // A wide character's continuation cell paints nothing, unless the left edge cut the
+        // character itself off, when it stands in as a blank.
+        let glyph = match glyph {
+            '\0' if i == h_scroll => ' ',
+            '\0' => continue,
+            g => g,
+        };
+        let mut style = Style::default().fg(fg);
+        if sel {
+            style = style.bg(p.sel_bg);
+        }
+        if run_style != Some(style) && !run.is_empty() {
+            out.push(Span::styled(std::mem::take(&mut run), run_style.unwrap_or_default()));
+        }
+        run_style = Some(style);
+        run.push(glyph);
+    }
+    if !run.is_empty() {
+        out.push(Span::styled(run, run_style.unwrap_or_default()));
+    }
+    out
+}
+
+/// The editor's pending question, boxed at the top of its pane like SCM mode's confirm. The
+/// footer lists the answers.
+fn render_edit_confirm(
+    frame: &mut Frame,
+    app: &App,
+    pane: Rect,
+    confirm: crate::edit_session::Confirm,
+) {
+    use crate::edit_session::Confirm;
+    let p = app.palette();
+    let (title, message) = match confirm {
+        Confirm::Close => {
+            ("unsaved changes", "save before closing?  s save · d discard · esc stay")
+        }
+        Confirm::Conflict { .. } => (
+            "changed on disk",
+            "the file changed since it was opened.  o overwrite · r reload · esc stay",
+        ),
+    };
+    let width = (message.width() as u16 + 4).min(pane.width.saturating_sub(2));
+    let rect = Rect { x: pane.x + 1, y: pane.y + 1, width, height: 3.min(pane.height) };
+    frame.render_widget(Clear, rect);
+    let block = bordered(title, true, p);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(message).style(text_style(p)), inner);
+}
+
 fn render_find_band(frame: &mut Frame, app: &App, area: Rect) {
     let Some(f) = app.find.as_ref() else { return };
     let p = app.palette();
@@ -3121,7 +3331,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::Save => ("enter".into(), "save"),
         A::Newline => ("shift+enter".into(), "newline"),
         A::Cancel | A::ClosePicker => ("esc".into(), "cancel"),
-        A::CloseList | A::CloseSearch | A::CloseFind => ("esc".into(), "close"),
+        A::CloseList | A::CloseSearch | A::CloseFind | A::EditClose => ("esc".into(), "close"),
         // The digits are literal, so they are spelled; the two movement keys are bound, so they
         // read off the keymap like every other hint.
         A::BasePick => (hint(K::BasePick), "base"),
@@ -3204,6 +3414,15 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
             "tabs",
         ),
         A::Quit => (hint(K::Quit), "quit"),
+        // The built-in editor's keys are fixed, like a text field's: every printable is text.
+        A::EditSave => ("^S".into(), "save"),
+        A::EditUndo => ("^Z/^Y".into(), "undo/redo"),
+        A::EditClipboard => ("^C/^X/^V".into(), "copy/cut/paste"),
+        A::EditAnswerSave => ("s".into(), "save and close"),
+        A::EditAnswerDiscard => ("d".into(), "discard"),
+        A::EditAnswerOverwrite => ("o".into(), "overwrite"),
+        A::EditAnswerReload => ("r".into(), "reload from disk"),
+        A::EditAnswerCancel => ("esc".into(), "keep editing"),
     };
     (k, l.into())
 }

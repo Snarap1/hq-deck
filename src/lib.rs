@@ -16,6 +16,8 @@ pub mod commit_msg;
 pub mod commit_template;
 pub mod config;
 pub mod diff;
+pub mod edit_buffer;
+pub mod edit_session;
 pub mod editor;
 pub mod export;
 pub mod file_list;
@@ -173,10 +175,11 @@ fn drain_input(app: &mut App) -> Result<()> {
 
 /// Service one `edit` request that named a file.
 ///
-/// A terminal editor owns the pane outright: it suspends down to a plain terminal, and the
-/// return rebuilds the same mode stack and refreshes the changeset. A window editor is opened
-/// and forgotten, so the pane never moves and the poll shows the writes like any other change
-/// to the worktree (Continuity). reviewr itself still writes nothing.
+/// With no `editor` configured, the built-in editor opens over the read pane, and the loop
+/// keeps running under it. Otherwise the configured command runs. A terminal editor owns the
+/// pane outright: it suspends down to a plain terminal, and the return rebuilds the same mode
+/// stack and refreshes the changeset. A window editor is opened and forgotten, so the pane never
+/// moves and the poll shows the writes like any other change to the worktree (Continuity).
 fn run_editor(
     terminal: &mut DefaultTerminal,
     app: &mut App,
@@ -185,28 +188,18 @@ fn run_editor(
     open: &mut Vec<std::process::Child>,
 ) -> Result<()> {
     let Some(target) = app.editor_request.take() else { return Ok(()) };
+    let Some(configured) = configured else {
+        app.open_inline_editor(&target);
+        return Ok(());
+    };
     // Absolute, so no editor can read the file name as one of its own flags and no dialect
     // needs a `--` guard (`src/editor.rs`). `absolute` keeps symlinks, unlike canonicalize, so
     // a worktree reached through one opens under the name the reviewer knows.
     let joined = app.repo.join(&target.path);
     let path = std::path::absolute(&joined).unwrap_or(joined);
-    let command = match editor::resolve(
-        configured,
-        std::env::var("VISUAL").ok().as_deref(),
-        std::env::var("EDITOR").ok().as_deref(),
-        &path,
-        target.line,
-    ) {
-        Ok(command) => command,
-        // Two causes, and the second would otherwise be told to set what it set.
-        Err(editor::NoEditor::Unset) => {
-            app.status = "set `editor` in the plugin config, or $EDITOR".into();
-            return Ok(());
-        }
-        Err(editor::NoEditor::NamesNoProgram) => {
-            app.status = "the editor setting names no program".into();
-            return Ok(());
-        }
+    let Ok(command) = editor::resolve(configured, &path, target.line) else {
+        app.status = "the editor setting names no program".into();
+        return Ok(());
     };
     // `all_files` lists what the index tracks, so a file removed from the worktree can still
     // be a row, and the changeset only catches it inside a scope that diffs the worktree
@@ -1005,6 +998,9 @@ fn event_loop(
                 app.reveal_file_cursor(file_vp);
             }
             app.bound_file_scroll(file_vp);
+            if let Some((text, _)) = ui::edit_text_geometry(area, app) {
+                app.settle_edit_view(text.height as usize, text.width as usize);
+            }
             let painted_frame = PaintedFrameSnapshot::capture(app);
             terminal.draw(|f| ui::render(f, app))?;
 
@@ -1325,7 +1321,11 @@ fn event_loop(
                             app.select_anchor
                         );
                     }
-                    // Bracketed paste: insert at the caret while composing, ignored otherwise.
+                    // Bracketed paste: into the built-in editor's buffer, or at the caret
+                    // while composing, ignored otherwise.
+                    Event::Paste(text) if app.mode == Mode::Editing => {
+                        app.edit_act(crate::edit_session::EditAction::Paste(text));
+                    }
                     Event::Paste(text) => {
                         app.input_paste(&text);
                         logln!("paste {} chars -> composing={}", text.len(), app.composing());
@@ -1371,6 +1371,9 @@ fn event_loop(
                 if app.tab.is_file_tab() {
                     app.request_world_refresh(false);
                 }
+                // The file under the built-in editor is checked against the disk, so the
+                // title says when the agent wrote it before a save would have to ask.
+                app.check_edit_disk();
                 logln!(
                     "poll files={} composing={} diff_cursor={} scroll={}",
                     app.entries.len(),
@@ -1622,6 +1625,121 @@ fn apply_text_edit(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bo
     }
 }
 
+/// One key in the built-in editor. The bindings are micro's, fixed like a text field's: every
+/// printable is text, and the commands are `ctrl` chords. While the editor asks a question, only
+/// its answers and `esc` act.
+fn handle_edit_key(app: &mut App, key: KeyEvent) {
+    use crate::edit_session::EditAction as E;
+    use KeyCode::{
+        BackTab, Backspace, Char, Delete, Down, End, Enter, Esc, Home, Left, PageDown, PageUp,
+        Right, Tab, Up,
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+    if app.edit_asking().is_some() {
+        match key.code {
+            Esc => app.edit_answer(None),
+            Char(c) if !ctrl && !alt => app.edit_answer(Some(c.to_ascii_lowercase())),
+            _ => {}
+        }
+        return;
+    }
+    let action = match key.code {
+        Esc => return app.edit_close(),
+        Char('q') if ctrl => return app.edit_close(),
+        Char('s') if ctrl => return app.edit_save(),
+        Char('c') if ctrl => {
+            if let Some(text) = app.edit_copy() {
+                copy_from_editor(app, &text);
+            }
+            return;
+        }
+        // `ctrl+k` is micro's cut-line; with no selection `cut` takes the line too.
+        Char('x' | 'k') if ctrl => {
+            if let Some(text) = app.edit_cut() {
+                copy_from_editor(app, &text);
+            }
+            return;
+        }
+        Char('v') if ctrl => return app.edit_paste(export::read_clipboard()),
+        // Redo is `ctrl+y`, or a shifted `ctrl+z`: `Z` under the kitty protocol, `z` with
+        // shift elsewhere.
+        Char(c) if ctrl && (c == 'y' || c == 'Z' || (c == 'z' && extend)) => E::Redo,
+        Char('z') if ctrl => E::Undo,
+        Char('a') if ctrl => E::SelectAll,
+        Char('d') if ctrl => E::Duplicate,
+        // `ctrl+backspace` arrives as `ctrl+h` from most terminals.
+        Char('h') if ctrl => E::DeleteWordBack,
+        Backspace if ctrl || alt => E::DeleteWordBack,
+        Char(c) if !ctrl && !alt => E::Type(c),
+        Enter => E::Newline,
+        Tab => E::Tab,
+        BackTab => E::BackTab,
+        Backspace => E::Backspace,
+        Delete => E::Delete,
+        Left => E::Left { word: ctrl || alt, extend },
+        Right => E::Right { word: ctrl || alt, extend },
+        Up => E::Up { extend },
+        Down => E::Down { extend },
+        PageUp => E::PageUp { extend },
+        PageDown => E::PageDown { extend },
+        Home if ctrl => E::DocStart { extend },
+        End if ctrl => E::DocEnd { extend },
+        Home => E::Home { extend },
+        End => E::End { extend },
+        _ => return,
+    };
+    app.edit_act(action);
+}
+
+/// Put the editor's copied or cut text on the reviewer's clipboard. The editor's own register
+/// already holds it, so a failed copy still pastes inside hq-deck, and the status says so.
+fn copy_from_editor(app: &mut App, text: &str) {
+    if let Err(e) = export::ExportTarget::export(&Clipboard, text) {
+        logln!("editor copy ERR: {e:#}");
+        app.status = "clipboard failed: the text pastes inside the editor only".into();
+    }
+}
+
+/// One mouse event over the built-in editor: a click places the cursor (`shift` extends), a
+/// drag that started in the text extends the selection, and the wheel scrolls. Everything
+/// outside the editor is inert while it is open, like any modal.
+fn handle_edit_mouse(app: &mut App, m: MouseEvent, area: Rect) {
+    use crate::edit_session::EditAction as E;
+    let Some((text, gutter)) = ui::edit_text_geometry(area, app) else { return };
+    // The gutter counts as the text: a click on a line number lands at its line's start.
+    let inside = m.column >= text.x.saturating_sub(gutter as u16)
+        && m.column < text.x + text.width
+        && m.row >= text.y
+        && m.row < text.y + text.height;
+    let cell = |m: MouseEvent| {
+        let row = m.row.clamp(text.y, (text.y + text.height).saturating_sub(1)) - text.y;
+        let col = m.column.saturating_sub(text.x);
+        (row as usize, col as usize)
+    };
+    let Some(session) = app.edit.as_mut() else { return };
+    if session.confirm.is_some() {
+        return;
+    }
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) if inside => {
+            let (row, col) = cell(m);
+            let extend = m.modifiers.contains(KeyModifiers::SHIFT);
+            session.drag = true;
+            session.act(E::Click { row, col, extend });
+        }
+        MouseEventKind::Drag(MouseButton::Left) if session.drag => {
+            let (row, col) = cell(m);
+            session.act(E::Click { row, col, extend: true });
+        }
+        MouseEventKind::Up(MouseButton::Left) => session.drag = false,
+        MouseEventKind::ScrollDown if inside => session.act(E::Scroll(3)),
+        MouseEventKind::ScrollUp if inside => session.act(E::Scroll(-3)),
+        _ => {}
+    }
+}
+
 /// The tab row is reachable from every tab: `1`…`5` switch wherever the press lands, including
 /// from a tab that runs its own key dispatch (`Pr`, `Scm`, `GitOps`). One rule, one place — a
 /// tab-local block that spelled its own switches out would silently strand the tabs it forgot.
@@ -1667,6 +1785,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
     app.cancel_gesture();
     // Any keypress is the user doing something else: the settled highlight clears
     app.clear_settled_selection();
+
+    if app.mode == Mode::Editing {
+        handle_edit_key(app, key);
+        return Ok(());
+    }
 
     if app.composing() {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -2598,6 +2721,10 @@ pub fn handle_mouse(
 
     // A modal captures new mouse gestures, but a divider gesture cancelled by the key that
     // opened it still owns its remaining drag and mouse-up events.
+    if app.mode == Mode::Editing {
+        handle_edit_mouse(app, m, area);
+        return Ok(());
+    }
     if app.mode.is_modal() {
         // Text selection stays available while the comment editor is open, selecting from the
         // frozen view under it; its clicks stay inert like the rest of the modal's pane

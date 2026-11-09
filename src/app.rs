@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::diff::{DiffCache, FileDiff, Row, View};
+use crate::edit_session::{Confirm, EditAction, EditSession, Saved};
 use crate::export::{ExportTarget, format_all};
 use crate::file_list::{self, Annotation, Entry, RowKind};
 use crate::forge;
@@ -433,6 +434,8 @@ pub enum Mode {
     /// The in-file find band over the read pane. Its state lives in
     /// [`App::find`].
     Find,
+    /// The built-in editor over the read pane. Its state lives in [`App::edit`].
+    Editing,
 }
 
 impl Mode {
@@ -442,8 +445,12 @@ impl Mode {
     ///
     /// `Search` replaces the body rather than holding a place in it, and `Find` is a band the
     /// reviewer navigates the live diff with. Neither freezes anything, so neither is modal here.
+    /// `Editing` covers the read pane, so the view under it holds still until the editor closes.
     pub fn is_modal(&self) -> bool {
-        matches!(self, Mode::Composing { .. } | Mode::List | Mode::BasePick | Mode::CommitPick)
+        matches!(
+            self,
+            Mode::Composing { .. } | Mode::List | Mode::BasePick | Mode::CommitPick | Mode::Editing
+        )
     }
 }
 
@@ -697,6 +704,18 @@ pub enum FooterAction {
     Refresh,
     Tabs,
     Quit,
+    /// The built-in editor's own bar: save, close, undo, and the clipboard trio.
+    EditSave,
+    EditClose,
+    EditUndo,
+    EditClipboard,
+    /// The editor's answers: closing with unsaved text (`s`/`d`/`esc`), and saving over a file
+    /// that changed on disk (`o`/`r`/`esc`).
+    EditAnswerSave,
+    EditAnswerDiscard,
+    EditAnswerOverwrite,
+    EditAnswerReload,
+    EditAnswerCancel,
 }
 
 /// Where a footer action sits: on row 1 (`Primary`, `Send`, or a `Do` cursor action), or in one of
@@ -934,6 +953,12 @@ pub struct App {
     /// An `edit` press that named a file. The event loop runs the editor, suspending the pane
     /// first only for one that draws there. `None` when idle.
     pub editor_request: Option<EditTarget>,
+    /// The built-in editor's session while `mode == Mode::Editing`, `None` otherwise. Its
+    /// unsaved text survives everything but an explicit discard, config recovery included.
+    pub edit: Option<crate::edit_session::EditSession>,
+    /// The built-in editor's own copy of the last text it copied or cut, which `ctrl+v` pastes
+    /// when the system clipboard cannot be read (over ssh, or with no clipboard tool).
+    edit_register: String,
     /// The in-file find band's state while `mode == Mode::Find`, `None` otherwise
     pub find: Option<Find>,
     /// Whether the tab-strip glyph paints this frame — maintained by the event loop's
@@ -1082,6 +1107,8 @@ impl App {
             search_dirty: false,
             search_track: None,
             editor_request: None,
+            edit: None,
+            edit_register: String::new(),
             find: None,
             refresh_indicator: false,
             refresh_commanded: false,
@@ -1115,6 +1142,9 @@ impl App {
             self.palette = theme.palette;
             self.highlighter = Highlighter::new(theme.syntax);
             self.cache = DiffCache::new();
+            if let Some(session) = &mut self.edit {
+                session.clear_highlight();
+            }
             self.markdown_cache.borrow_mut().clear();
             self.snippet_cache.borrow_mut().clear();
         }
@@ -1196,6 +1226,7 @@ impl App {
         // error must not forget which agent the session sent to.
         // The commit pick is session memory like the comments: replaced, never cleared
         self.commit_pick = old.commit_pick.take();
+        self.edit_register = std::mem::take(&mut old.edit_register);
         self.navigator_side_pct = old.navigator_side_pct;
         self.navigator_stack_pct = old.navigator_stack_pct;
         self.navigator_hidden = old.navigator_hidden;
@@ -1215,7 +1246,11 @@ impl App {
             // before the mode is stored, so none reaches recovery; the search query is not
             // restored and the picker's frozen rows are not either.
             Mode::Normal | Mode::Search | Mode::Find => {}
-            Mode::List | Mode::Composing { .. } | Mode::BasePick | Mode::CommitPick => {
+            Mode::List
+            | Mode::Composing { .. }
+            | Mode::BasePick
+            | Mode::CommitPick
+            | Mode::Editing => {
                 self.scope = old.scope;
                 self.tab = old.tab;
                 self.active_file_tab = old.active_file_tab;
@@ -1254,6 +1289,9 @@ impl App {
                 self.base_picker = old.base_picker.take();
                 // So does the commit picker, with its highlight and anchor.
                 self.commit_picker = old.commit_picker.take();
+                // And the built-in editor, unsaved text, history, and pending question whole:
+                // a config typo must never cost an edit.
+                self.edit = old.edit.take();
             }
         }
     }
@@ -3702,6 +3740,162 @@ impl App {
         self.editor_request = self.edit_target();
     }
 
+    /// Open the built-in editor on `target`: the file an `edit` press named while no `editor`
+    /// is configured. A file it cannot edit leaves the view as it was and says why.
+    pub fn open_inline_editor(&mut self, target: &EditTarget) {
+        match EditSession::open(&self.repo, &target.path, target.line) {
+            Ok(session) => {
+                self.cancel_gesture();
+                self.edit = Some(session);
+                self.mode = Mode::Editing;
+                self.status.clear();
+            }
+            Err(why) => self.status = format!("can't edit {}: {why}", target.path),
+        }
+    }
+
+    /// One editing gesture. Inert while the editor waits on an answer.
+    pub fn edit_act(&mut self, action: EditAction) {
+        if let Some(session) = self.edit.as_mut()
+            && session.confirm.is_none()
+        {
+            session.act(action);
+        }
+    }
+
+    /// `ctrl+c`: the text to put on the clipboard, also kept in the editor's own register.
+    pub fn edit_copy(&mut self) -> Option<String> {
+        let session = self.edit.as_ref().filter(|s| s.confirm.is_none())?;
+        let text = session.copy();
+        self.edit_register.clone_from(&text);
+        Some(text)
+    }
+
+    /// `ctrl+x`: like [`Self::edit_copy`], and the text leaves the buffer.
+    pub fn edit_cut(&mut self) -> Option<String> {
+        let session = self.edit.as_mut().filter(|s| s.confirm.is_none())?;
+        let text = session.cut();
+        self.edit_register.clone_from(&text);
+        Some(text)
+    }
+
+    /// `ctrl+v`: paste the system clipboard's text, or the editor's register when the
+    /// clipboard could not be read.
+    pub fn edit_paste(&mut self, clipboard: Option<String>) {
+        let text =
+            clipboard.filter(|t| !t.is_empty()).unwrap_or_else(|| self.edit_register.clone());
+        if !text.is_empty() {
+            self.edit_act(EditAction::Paste(text));
+        }
+    }
+
+    /// `ctrl+s`: write the file, or ask first when it changed on disk since it was read.
+    pub fn edit_save(&mut self) {
+        if self.edit.as_ref().is_some_and(|s| s.confirm.is_none()) {
+            self.save_edit(false, false);
+        }
+    }
+
+    fn save_edit(&mut self, force: bool, then_close: bool) {
+        let Some(session) = self.edit.as_mut() else { return };
+        match session.save(force) {
+            Saved::Written => {
+                session.confirm = None;
+                self.status = format!("saved {}", session.path);
+                // The navigator, the diff, and the File view catch up on the refresh, like
+                // after any other write to the worktree.
+                self.request_world_refresh(false);
+                if then_close {
+                    self.finish_edit();
+                }
+            }
+            Saved::Conflict => session.confirm = Some(Confirm::Conflict { then_close }),
+            Saved::Failed(e) => {
+                session.confirm = None;
+                self.status = format!("save failed: {e}");
+            }
+        }
+    }
+
+    /// `esc`: close the editor, asking first when there is unsaved text.
+    pub fn edit_close(&mut self) {
+        let Some(session) = self.edit.as_mut() else { return };
+        if session.is_dirty() {
+            session.confirm = Some(Confirm::Close);
+        } else {
+            self.finish_edit();
+        }
+    }
+
+    /// Answer the editor's pending question with `key`, or with `esc` for `None`. A key the
+    /// question does not offer is inert.
+    pub fn edit_answer(&mut self, key: Option<char>) {
+        let Some(session) = self.edit.as_mut() else { return };
+        let Some(confirm) = session.confirm else { return };
+        match (confirm, key) {
+            (_, None) => session.confirm = None,
+            (Confirm::Close, Some('s')) => self.save_edit(false, true),
+            (Confirm::Close, Some('d')) => self.finish_edit(),
+            (Confirm::Conflict { then_close }, Some('o')) => self.save_edit(true, then_close),
+            (Confirm::Conflict { then_close }, Some('r')) => match session.reload() {
+                Ok(()) => {
+                    session.confirm = None;
+                    self.status = format!("reloaded {}", session.path);
+                    if then_close {
+                        self.finish_edit();
+                    }
+                }
+                Err(why) => {
+                    session.confirm = None;
+                    self.status = format!("can't reload {}: {why}", session.path);
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// The file the built-in editor holds unsaved text for, if any.
+    pub fn unsaved_edit(&self) -> Option<&str> {
+        self.edit.as_ref().filter(|s| s.is_dirty()).map(|s| s.path.as_str())
+    }
+
+    /// Whether the editor is waiting on an answer.
+    pub fn edit_asking(&self) -> Option<Confirm> {
+        self.edit.as_ref().and_then(|s| s.confirm)
+    }
+
+    /// Leave the editor. The view under it held still while it was open, so it catches up now.
+    fn finish_edit(&mut self) {
+        self.edit = None;
+        self.mode = Mode::Normal;
+        self.reload_open_view();
+    }
+
+    /// Compare the edited file with the disk, on the poll.
+    pub fn check_edit_disk(&mut self) {
+        if let Some(session) = self.edit.as_mut() {
+            session.check_disk();
+        }
+    }
+
+    /// Settle the editor's scroll for the viewport the frame is about to paint.
+    pub fn settle_edit_view(&mut self, rows: usize, cols: usize) {
+        if let Some(session) = self.edit.as_mut() {
+            session.settle(rows, cols);
+        }
+    }
+
+    /// Highlight the editor's lines up to `upto` and hand the highlight to the renderer's
+    /// `read`. `None` while no file is open for editing.
+    pub fn with_edit_highlight<R>(
+        &self,
+        upto: usize,
+        read: impl FnOnce(&crate::highlight::LineHighlights) -> R,
+    ) -> Option<R> {
+        let session = self.edit.as_ref()?;
+        Some(session.with_highlight(&self.highlighter, upto, read))
+    }
+
     /// Whether a comment takes the key here, rather than the file.
     ///
     /// A comment claims it only where its card is on screen. With the navigator focused the
@@ -3841,7 +4035,8 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            Mode::Normal | Mode::List | Mode::CommitPick => None,
+            // The editor's buffer is a document, not a field: it edits through `edit_act`.
+            Mode::Normal | Mode::List | Mode::CommitPick | Mode::Editing => None,
         }
     }
 
@@ -4179,7 +4374,8 @@ impl App {
             | Mode::BasePick
             | Mode::CommitPick
             | Mode::Search
-            | Mode::Find => None,
+            | Mode::Find
+            | Mode::Editing => None,
         }
     }
 
@@ -4805,6 +5001,27 @@ impl App {
                     vec![(A::FindStep, Primary), (A::CloseFind, Do)]
                 } else {
                     vec![(A::CloseFind, Primary)]
+                };
+            }
+            Mode::Editing => {
+                // A pending question owns the bar: only its answers work.
+                return match self.edit_asking() {
+                    Some(Confirm::Close) => vec![
+                        (A::EditAnswerSave, Primary),
+                        (A::EditAnswerCancel, Do),
+                        (A::EditAnswerDiscard, Do),
+                    ],
+                    Some(Confirm::Conflict { .. }) => vec![
+                        (A::EditAnswerOverwrite, Primary),
+                        (A::EditAnswerCancel, Do),
+                        (A::EditAnswerReload, Do),
+                    ],
+                    None => vec![
+                        (A::EditSave, Primary),
+                        (A::EditClose, Do),
+                        (A::EditUndo, Do),
+                        (A::EditClipboard, Do),
+                    ],
                 };
             }
             Mode::Normal => {}
@@ -5743,6 +5960,28 @@ mod tests {
         // `no base` beside a populated list.
         let base = recovered.branch_base.winner.as_ref().expect("the resolved base is carried");
         assert_eq!(base.name(), "main");
+    }
+
+    #[test]
+    fn config_recovery_carries_the_built_in_editor_with_its_unsaved_text() {
+        use super::{Confirm, EditAction, EditTarget};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let mut old = App::blocked(dir.path().to_path_buf(), Scope::Uncommitted, None);
+        old.open_inline_editor(&EditTarget { path: "a.txt".into(), line: 1 });
+        old.edit_act(EditAction::Type('x'));
+        old.edit_close();
+        assert_eq!(old.edit_asking(), Some(Confirm::Close));
+        old.edit_register = "copied".into();
+
+        let mut recovered = App::new(dir.path().to_path_buf(), Scope::Uncommitted, None);
+        recovered.carry_authored_state_from(&mut old);
+        assert_eq!(recovered.mode, Mode::Editing);
+        let session = recovered.edit.as_ref().expect("the session survives recovery");
+        assert_eq!(session.buffer.lines(), ["xone"], "with its unsaved text");
+        assert_eq!(session.confirm, Some(Confirm::Close), "and the question it was asking");
+        assert_eq!(recovered.edit_register, "copied");
+        assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap(), "one\n");
     }
 
     #[test]

@@ -47,8 +47,8 @@ One binary, one git worktree per process (`hq-deck [repo]`).
 Load-bearing. Cite them by name.
 
 - **Writes are asked for**: every mutation of the repository is the direct result of a keystroke that named it.
-  The places that make them are `Changes`' SCM mode (stage, unstage, discard, commit, and the `.` menu's checkout/stash/tag/branch/worktree entries) and `GitOps` (pull/push/fetch/merge/rebase).
-  Destructive ones confirm first.
+  The places that make them are `Changes`' SCM mode (stage, unstage, discard, commit, and the `.` menu's checkout/stash/tag/branch/worktree entries), `GitOps` (pull/push/fetch/merge/rebase), and the built-in editor's `ctrl+s` (one worktree file, `EditSession::save`).
+  Destructive ones confirm first, and the editor's save never overwrites a file that changed on disk since it was read without asking (`o`/`r`).
   Everywhere else deck reads: the diff, `All files`, search, preview, and the `PR` tab (which never posts to a forge) mutate nothing.
   No path mutates on a poll, a refresh, or a fetch landing.
   The only other git writes are two worktree-private refs, `refs/worktree/reviewr/{base-pick,turn-base}`, written by `B`'s pick and `M`'s mark.
@@ -56,6 +56,8 @@ Load-bearing. Cite them by name.
   The boundary must not drift further without an explicit decision.
 - **Comments survive**: comments are never lost to a refresh or the agent's edits, and leave only by an explicit successful export (`s` send, `y` copy).
   The comment store is in-memory by design - do not propose persisting it.
+  The built-in editor's unsaved text holds to the same rule: no poll, refresh, agent write, or config recovery touches the buffer, and it leaves only by a save, an explicit discard (`d`), or a reload the user answered (`r`).
+  The one quit reachable while it is open, the blocked config screen's `q`, says on that screen that it discards the edit.
 - **Continuity**: place state (cursor, scroll, tab, scope, folds, selection, layout) moves only under the user's own input.
   World events (polls, refreshes, fetch results) may only reconcile it: match by identity first (path, comment author+anchor, never row index), fall back to the nearest surviving target, clamp last.
   Derived state on screen may be stale, never wrong: blank a view only when its identity changed, never because the same thing gained newer content.
@@ -76,7 +78,7 @@ World results land through `land_world_completion`: input-tagged, latest-wins, r
   Tabs: `Changes`/`AllFiles`/`Pr`/`GitOps`; `Changes` has a second navigator face, SCM mode (`scm_open` holds the scope it left, `scm_active()` is the one test).
   Scopes: `Uncommitted`/`Branch`/`LastTurn`/`Commits`.
   `Focus` is files vs diff pane.
-  `Mode` is `Normal`, the `Composing`/`List`/`BasePick`/`CommitPick` overlays, the `Find` band, and the body-replacing `Search` screen.
+  `Mode` is `Normal`, the `Composing`/`List`/`BasePick`/`CommitPick` overlays, the `Editing` built-in editor over the read pane, the `Find` band, and the body-replacing `Search` screen.
   The SCM-mode and `GitOps` overlays are deliberately not `Mode` variants; they are fields on their tab's panel.
   `reconcile_world()` is the one place a world snapshot touches place state.
   `reload()` is the synchronous build+reconcile pair used at startup, first tab visits, and scope switches.
@@ -120,11 +122,21 @@ World results land through `land_world_completion`: input-tagged, latest-wins, r
   A diff row (`Changes`, file tree or SCM mode, which pins the `uncommitted` scope) makes a diff comment.
   The File view and the markdown preview paint current worktree content, so they make content comments.
   Staging changes neither: the `uncommitted` diff is `HEAD` vs the worktree, which a stage does not move.
-- `src/editor.rs` - the editor command: a name-keyed dialect table, quote-aware splitting, and the `editor` key's `{file}`/`{line}` template.
-  Pure argv resolution; `run_editor` in `lib.rs` owns the spawn and hands the pane over for a terminal editor.
+- `src/editor.rs` - the external editor command from the `editor` key: a name-keyed dialect table for a bare command, quote-aware splitting, and the `{file}`/`{line}` template.
+  `$EDITOR`/`$VISUAL` are never read: with no `editor` key, `e` opens the built-in editor.
+  Pure argv resolution; `run_editor` in `lib.rs` picks built-in or external, owns the spawn, and hands the pane over for a terminal editor.
+- `src/edit_buffer.rs` - the built-in editor's text: lines, cursor, selection, undo/redo, and the file's line ending and final newline.
+  Pure; every mutation goes through one `replace` primitive, which records the undo step and the line `Splice` the highlighter replays.
+  A file a round trip could corrupt (binary, not UTF-8, mixed `\n`/`\r\n`) is refused at `parse`.
+- `src/edit_session.rs` - one file open in the built-in editor: the buffer, its scroll, the disk check, the pending question, and the save.
+  `App` holds one field (`edit`) and delegating methods; keep editor state here, not in `app.rs`.
+  The per-line highlight (`highlight::LineHighlights`) lives in a thread-local keyed by session, not in the session: syntect's parser state is `!Send` under oniguruma, and `App` must be `Send` for config recovery.
+  The cache is derived, so a missing entry is rebuilt from the text.
+  Keys are fixed (micro's) and dispatched by `handle_edit_key` in `lib.rs`, not the keymap; only `e` itself is rebindable.
 - `src/export.rs` - comment formatting (`format_all`) and the `ExportTarget` trait, plus the clipboard target: `wl-copy`/`xclip`/`xsel` on a local display, OSC 52 over ssh or with no display (and as the fallback when a tool fails).
   OSC 52 has no acknowledgement, so it counts as success once written to a terminal stdout.
   `App::export` consumes comments only on `Ok`.
+  `read_clipboard` is the editor's `ctrl+v`: the paired paste tools on a local display, `None` elsewhere (OSC 52 cannot be read back), where the editor pastes its own register.
 - `src/agent.rs` - the `send` target over herdr-core or the older herdr.
   `Host` chooses per send: `$HC_TERMINAL_ID` means `hc`, else `$HERDR_PANE_ID` means herdr, else `hc`.
   It picks the agent from `hc ls --json` or `herdr agent list`: live, local (no `machine/` prefix), reporting status (OSC 7501, hc's only notion of an agent; herdr's list holds only agents), not hq-deck's own terminal, with `cwd` at or under the worktree.
