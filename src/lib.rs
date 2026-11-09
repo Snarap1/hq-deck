@@ -1642,6 +1642,15 @@ fn switch_tab(app: &mut App, action: Option<crate::keymap::Action>) -> Result<bo
     Ok(true)
 }
 
+/// The action an `alt+<c>` chord names in `keymap`, if any - how the search screen, whose bare
+/// letters are query text, still honors the rebindable path actions.
+fn path_action(keymap: &Keymap, c: char) -> Option<crate::keymap::Action> {
+    let key = crate::keymap::Key { ctrl: false, alt: true, code: keymap::KeyCode::Char(c) };
+    keymap
+        .action_for(key)
+        .filter(|a| matches!(a, crate::keymap::Action::CopyPath | crate::keymap::Action::SendPath))
+}
+
 /// Map one key press onto `App` through `keymap` — the keymap of the frame on screen, so a
 /// stale hint never dispatches a different action than it advertised.
 /// Public for the dispatch tests; the event loop is the runtime caller.
@@ -1696,8 +1705,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             Up => app.search_move(-1),
             Char('n') if ctrl => app.search_move(1),
             Char('p') if ctrl => app.search_move(-1),
-            // `alt`, not a bare letter: every bare letter here is query text.
-            Char('y') if alt => app.copy_file_path(),
+            // The path actions are `alt` chords, not bare letters: every bare letter here is
+            // query text. They resolve through the keymap, so a rebinding holds here too.
+            Char(c) if alt && path_action(keymap, c) == Some(K::CopyPath) => app.copy_file_path(),
+            Char(c) if alt && path_action(keymap, c) == Some(K::SendPath) => {
+                app.send_file_path(&crate::agent::Agent::from_env(&app.repo));
+            }
             code => apply_text_edit(app, code, ctrl, alt, word),
         }
         return Ok(());
@@ -2021,6 +2034,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Edit => app.start_edit(),
             K::Delete if app.focus == Focus::Diff => app.delete_comment(),
             K::CopyPath => app.copy_file_path(),
+            K::SendPath => {
+                app.send_file_path(&crate::agent::Agent::from_env(&app.repo));
+            }
             K::Send => {
                 app.export(&crate::agent::Agent::from_env(&app.repo));
             }

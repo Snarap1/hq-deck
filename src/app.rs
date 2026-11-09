@@ -643,6 +643,8 @@ pub enum FooterAction {
     /// Copy the highlighted file's path to the clipboard - offered on a search result and on
     /// a file row in the navigator tree.
     CopyPath,
+    /// Send the same path to the agent; offered wherever `CopyPath` is.
+    SendPath,
     List,
     Copy,
     Save,
@@ -4788,6 +4790,7 @@ impl App {
                         (A::PickResult, Do),
                         (A::OpenResult, Do),
                         (A::CopyPath, Do),
+                        (A::SendPath, Do),
                         (A::CloseSearch, Do),
                     ]
                 } else {
@@ -4950,6 +4953,7 @@ impl App {
             // A file row (not a directory) can go straight to an agent.
             if matches!(row_kind, Some(RowKind::File { .. })) {
                 out.push((A::CopyPath, Do));
+                out.push((A::SendPath, Do));
             }
         } else if self.visible.is_empty() {
             if self.navigator_hidden_here() {
@@ -5082,7 +5086,7 @@ impl App {
     /// or a dir row does nothing.
     pub fn copy_file_path(&mut self) {
         use crate::export::{Clipboard, ExportTarget};
-        let Some(path) = self.copy_path_target() else { return };
+        let Some(path) = self.file_path_target() else { return };
         logln!("copy-path :: {path}");
         self.status = match Clipboard.export(&path) {
             Ok(()) => format!("copied {path}"),
@@ -5093,10 +5097,25 @@ impl App {
         };
     }
 
-    /// The path `copy-path` would copy, or `None` where the cursor names no file: the
-    /// search screen's highlighted pick, else a file row (not a directory) in the navigator
+    /// `send-path`: the same path `copy-path` would copy goes to the agent instead, as plain
+    /// text - a mention it can open itself. Comments stay put: only `send` consumes them.
+    /// Silent with no file to name, like `copy-path`.
+    pub fn send_file_path(&mut self, target: &dyn ExportTarget) {
+        let Some(path) = self.file_path_target() else { return };
+        logln!("send-path -> {} :: {path}", target.label());
+        self.status = match target.export(&path) {
+            Ok(()) => format!("sent {path}"),
+            Err(e) => {
+                logln!("send-path ERR: {e:#}");
+                target.failure_message_for(&e)
+            }
+        };
+    }
+
+    /// The path `copy-path` and `send-path` act on, or `None` where the cursor names no file:
+    /// the search screen's highlighted pick, else a file row (not a directory) in the navigator
     /// tree. Pure and total, like `edit_target`, so the footer and the press cannot disagree.
-    fn copy_path_target(&self) -> Option<String> {
+    fn file_path_target(&self) -> Option<String> {
         if self.mode == Mode::Search {
             return match self.search.as_ref()?.picked()? {
                 PickedResult::File(f) => Some(f.path.clone()),

@@ -45,5 +45,7 @@ The mod itself draws nothing: no panel, no sidebar entry, no popup you can see.
 ## Done when
 
 - `herdr-app check mods/hq-deck` passes.
-- With a terminal focused in a git repository, `super-y` adds one pane to its right running `hq-deck`, and `hc ls` shows a terminal with agent `hq-deck` and that `cwd`.
+- With a terminal focused in a git repository, `super-y` adds one pane to its right running `hq-deck`, and `hc ls --json` shows one new terminal with that `cwd` and no `status`.
+  `hc` does not name it after the program: its AGENT column reads `sh`.
+- On a remote machine (a focused `machine/t<n>` terminal), the new pane opens on that machine and runs its own `hq-deck`, so it must be installed there; the herdr-app machine needs only the mod and the key.
 - `herdr-app status` shows `"overlays": []` and `"errors": []` afterwards.

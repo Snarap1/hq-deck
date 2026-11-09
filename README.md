@@ -34,7 +34,7 @@ Besides the SCM writes, hq-deck writes exactly two refs, `refs/worktree/reviewr/
 - A **truecolor** terminal with Unicode box-drawing.
 - **Linux.**
 - A **Rust toolchain** - it is installed from source.
-- For `s`, one of: **`hc`** ([herdr-core](https://github.com/herdrdev/herdr-core)) on `PATH`, with the agent running in an `hc` terminal; or hq-deck running in a pane of the older **herdr** (0.7.5 or newer).
+- For `s` and `alt+s`, one of: **`hc`** ([herdr-core](https://github.com/herdrdev/herdr-core)) on `PATH`, with the agent running in an `hc` terminal; or hq-deck running in a pane of the older **herdr** (0.7.5 or newer).
 - On a local display, a clipboard tool: `wl-copy`, `xclip`, or `xsel`. `y` and `alt+y` copy through it.
   Over ssh, on a remote `hc` machine, or with no display at all, they copy through the terminal with OSC 52 instead, so the terminal you look at must support it (herdr-app, kitty, WezTerm, foot, Alacritty, and tmux with `set-clipboard on` do).
 - **`gh`** (GitHub) or **`glab`** (GitLab), authenticated. Only the **PR** tab needs one.
@@ -113,6 +113,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | `→` `←` | Expand / collapse, or scroll sideways |
 | `/` | Search files and code |
 | `Alt+Y` | Copy the file's path (a file row in the navigator, or a search result) |
+| `Alt+S` | Send that path to the agent |
 | `Ctrl+F` | Find in file |
 | `w` | Toggle line wrap |
 | `M` | Mark the worktree as the **last turn** baseline |
@@ -436,6 +437,7 @@ The action names and their defaults:
 | `find` | `ctrl+f` |
 | `keys` | `?` |
 | `copy-path` | `alt+y` |
+| `send-path` | `alt+s` |
 | `mark-turn` | `M` |
 | `send` | `s` |
 | `copy` | `y`, `Y` |

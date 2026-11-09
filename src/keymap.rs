@@ -49,6 +49,8 @@ pub enum Action {
     Find,
     Keys,
     CopyPath,
+    /// Send the highlighted file's path to the agent through `hc send` or herdr.
+    SendPath,
     /// Snapshot the worktree as the `last-turn` scope's baseline.
     MarkTurn,
     /// Send every comment to the agent through `hc send` or herdr.
@@ -170,7 +172,7 @@ impl Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 49] = [
+const ACTIONS: [(Action, &str, &[Key]); 50] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -218,6 +220,7 @@ const ACTIONS: [(Action, &str, &[Key]); 49] = [
     // filter box, so this is the only chord free of that clash (`apply_text_edit` already
     // claims every `ctrl+<letter>` a text field would want for caret movement).
     (Action::CopyPath, "copy-path", &[Key::alt('y')]),
+    (Action::SendPath, "send-path", &[Key::alt('s')]),
     (Action::Send, "send", &[Key::plain('s')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
@@ -363,6 +366,7 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('G')), Some(Action::CommitPick));
         assert_eq!(keymap.action_for(Key::plain('?')), Some(Action::Keys));
         assert_eq!(keymap.hint(Action::CopyPath), Key::alt('y'));
+        assert_eq!(keymap.hint(Action::SendPath), Key::alt('s'));
         assert_eq!(keymap.hint(Action::TabPr), Key::plain('3'));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Right)), Some(Action::Expand));
         assert_eq!(keymap.action_for(Key::named(KeyCode::Left)), Some(Action::Collapse));

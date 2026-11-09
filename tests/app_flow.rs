@@ -4714,9 +4714,37 @@ mod search_overlay {
                 FooterAction::PickResult,
                 FooterAction::OpenResult,
                 FooterAction::CopyPath,
+                FooterAction::SendPath,
                 FooterAction::CloseSearch
             ]
         );
+    }
+
+    /// `send-path` hands the highlighted pick's path, and only the path, to the target.
+    /// The comments stay put: only `send` consumes them.
+    #[test]
+    fn send_path_sends_the_picked_result_and_keeps_comments() {
+        let repo = super::edited_repo();
+        let keymap = default_keymap().clone();
+        let mut app = app_on(&repo);
+        super::comment_on(&mut app, '+', "note");
+        enter_tab(&mut app, Tab::AllFiles);
+        open(&mut app, &keymap);
+
+        // Nothing picked yet: silent, nothing sent.
+        let target = super::FakeTarget::ok();
+        app.send_file_path(&target);
+        assert!(target.captured.borrow().is_empty(), "no pick, no send");
+
+        land_search_completion(&mut app, done(1, results(vec![file_hit("a.rs")], Vec::new())), 1);
+        app.send_file_path(&target);
+        assert_eq!(target.last(), "a.rs");
+        assert_eq!(app.status, "sent a.rs");
+        assert_eq!(app.store.len(), 1, "sending a path keeps the comments");
+
+        let failing = super::FakeTarget::failing();
+        app.send_file_path(&failing);
+        assert_eq!(app.status, "fake not found", "a failure shows the target's line");
     }
 
     /// A divider gesture cancelled by `/` still owns its mouse-up: the release frees the

@@ -3115,6 +3115,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         ),
         A::SendAll => return (hint(K::Send), format!("send {}", app.store.len())),
         A::CopyPath => (hint(K::CopyPath), "copy path"),
+        A::SendPath => (hint(K::SendPath), "send path"),
         A::List => (hint(K::Comments), "comments"),
         A::Copy => (hint(K::Copy), "copy"),
         A::Save => ("enter".into(), "save"),
