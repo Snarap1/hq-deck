@@ -11,10 +11,18 @@ Usage:
   scripts/bench_tui.py --binary target/release/hq-deck --repo /path/to/repo --label landing
   scripts/bench_tui.py ... --json out.json      # machine-readable results
   scripts/bench_tui.py ... --iterations 12
+  scripts/bench_tui.py ... --repo /path/to/repo --editor-file src/big.rs
 
 The fixture repo is generated deterministically (same content every time) in
 --fixture-dir (default: <scratch>/reviewr-bench-fixture), so numbers are
 comparable across sessions and machines of the same class.
+
+The built-in editor scenarios (`editor_*`) run in a second session on a big highlighted
+source file: the fixture's src/generated.rs, or the repo's --editor-file. They open the file
+through search and `e`, and never press ctrl+s: a closing editor with unsaved text is answered
+`d` (discard), and the run fails if the file's bytes changed on disk. Run it detached, like the
+other PTY scripts (crossterm sizes the pane from /dev/tty):
+  setsid python3 scripts/bench_tui.py --binary target/release/hq-deck --fixture < /dev/null
 """
 
 import argparse
@@ -23,6 +31,7 @@ import hashlib
 import json
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -39,6 +48,19 @@ COLS, ROWS = 160, 45
 # that late frame into the next timed press).
 QUIET_MS = 300
 SETTLE_TIMEOUT = 30.0
+
+# The fixture's big highlighted source (9000 lines, ~500KB of .rs): what the editor scenarios open.
+FIXTURE_EDITOR_FILE = "src/generated.rs"
+CSI = re.compile(rb"\x1b\[[0-9;?]*[ -/]*[@-~]")
+ESC, CTRL_F, PGDN = "\x1b", "\x06", "\x1b[6~"
+# Pages from the top that land `pgdn` well inside the 9000-line fixture file, whatever the pane height.
+MID_PAGES = 100
+# Set when a scenario group could not run, so the exit code tells.
+FAILED = []
+
+
+class BenchError(Exception):
+    """A scenario group cannot go on: the app was not where the script thought it was."""
 
 # --- fixture -----------------------------------------------------------------
 
@@ -108,28 +130,39 @@ class Session:
         """Drain output until a quiet gap; returns (first_byte_at, last_byte_at, n_bytes)."""
         first = last = None
         total = 0
+        chunks = []
         deadline = time.perf_counter() + timeout
-        while True:
-            now = time.perf_counter()
-            if now > deadline:
-                break
-            wait = quiet_ms / 1000 if last is not None else deadline - now
-            r, _, _ = select.select([self.master], [], [], wait)
-            if not r:
-                if last is not None:
-                    break  # quiet gap after data: frame done
-                continue
-            try:
-                data = os.read(self.master, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            t = time.perf_counter()
-            first = first if first is not None else t
-            last = t
-            total += len(data)
+        try:
+            while True:
+                now = time.perf_counter()
+                if now > deadline:
+                    break
+                wait = quiet_ms / 1000 if last is not None else deadline - now
+                r, _, _ = select.select([self.master], [], [], wait)
+                if not r:
+                    if last is not None:
+                        break  # quiet gap after data: frame done
+                    continue
+                try:
+                    data = os.read(self.master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                t = time.perf_counter()
+                first = first if first is not None else t
+                last = t
+                total += len(data)
+                chunks.append(data)
+        finally:
+            self.raw = b"".join(chunks)  # for `text`; joined after the last timestamp is taken
         return first, last, total
+
+    @property
+    def text(self):
+        """What the last read painted, escape codes taken out. A frame repaints only the cells
+        that changed, so a check looks for text that the keypress itself changed."""
+        return CSI.sub(b"", self.raw).decode("utf-8", "replace")
 
     def settle(self):
         self._read_until_quiet(500, SETTLE_TIMEOUT)
@@ -178,7 +211,121 @@ def stats(xs):
     }
 
 
-def run_bench(binary, repo, label, iters):
+def run_editor_bench(binary, repo, iters, editor_file):
+    """Built-in editor scenarios, in their own session so the other scenarios' numbers and state
+    are untouched. Every timed press is checked to have landed in the editor (the `editing` title,
+    the find band, its match count); the file is only ever read, and its hash is compared at the
+    end because ctrl+s is never pressed."""
+    path = os.path.join(repo, editor_file)
+    name = os.path.basename(editor_file)
+    with open(path, "rb") as f:
+        before = hashlib.sha256(f.read()).hexdigest()
+    s = Session(binary, repo)
+    s.settle()
+    results = []
+
+    def need(ok, what):
+        if not ok:
+            raise BenchError(what)
+
+    def key(k, what=None):
+        """An untimed press that must be answered; returns what it painted."""
+        f, _ = s.press(k)
+        need(f is not None, f"no response for {what or repr(k)}")
+        return s.text
+
+    def open_editor():
+        need("editing" in key("e", "`e`"), "`e` did not open the built-in editor")
+
+    def leave():
+        """Close the editor. Unsaved text asks first, and the answer is always discard."""
+        out = key(ESC, "closing the editor")
+        if "unsaved changes" in out:
+            out = key("d", "discarding the edit")
+        need("editing" not in out, "the editor did not close")
+
+    def open_band():
+        need("find in buffer" in key(CTRL_F, "ctrl+f"), "ctrl+f did not open the find band")
+
+    def timed(label, k, before=None, after=None, expect=None):
+        """Press `k` iters times, timing each. `before`/`after` run untimed around every press;
+        `expect` must be in the first press's paint."""
+        firsts, dones = [], []
+        for i in range(iters):
+            if before:
+                before()
+            f, d = s.press(k)
+            need(f is not None, f"no response for {label} key {k!r}")
+            if i == 0 and expect:
+                need(expect in s.text, f"{label}: the paint never said {expect!r}")
+            firsts.append(f)
+            dones.append(d)
+            if after:
+                after()
+        results.append(result_row(label, firsts, dones))
+
+    def type_query():
+        key("fn f", "the find query")  # a fixture line each; the timed `_` keeps all 9000 matching
+        key("_", "the find query")
+
+    try:
+        # The file view of the big file, through search: the fixture's changeset does not touch it.
+        key("2", "the All files tab")
+        key("/", "search")
+        key(editor_file, "the search query")
+        s.settle()  # results arrive off the frame loop
+        need(name in key("\r", "opening the search pick"), f"search did not open {editor_file}")
+
+        timed("editor_open", "e", after=leave, expect="editing")
+
+        open_editor()
+        timed("editor_pgdn", PGDN)
+        leave()
+
+        open_editor()
+        # The find band, then a query matching every line, then a step between matches.
+        timed("editor_find_open", CTRL_F, after=lambda: key(ESC, "closing the band"),
+              expect="find in buffer")
+        open_band()
+        # The frame repaints only the digits that changed, so the 9000 may arrive as `900`.
+        need("900" in key("fn f_", "the find query"), "the band never counted the ~9000 matches")
+        need("1/" in key("\r", "stepping to a match"), "enter did not step to the first match")
+        key(ESC, "closing the band")
+        timed("editor_find_query", "_", before=lambda: (open_band(), key("fn f", "the find query")),
+              after=lambda: key(ESC, "closing the band"))
+        open_band()
+        type_query()
+        timed("editor_find_next", "\r")
+        key(ESC, "closing the band")
+        leave()
+
+        # Typing in the middle of the file: pgdn from the top lands inside it (checked by the
+        # gutter), and the first typed character must mark the buffer unsaved.
+        open_editor()
+        key(PGDN * MID_PAGES, "paging to the middle")
+        s.settle()
+        # Every line matches `fn f_`, so the first step's `N/9000` is the cursor's line number.
+        open_band()
+        key("fn f_", "the find query")
+        step = [int(n) for n in re.findall(r"(\d+)/", key("\r", "stepping to a match"))]
+        need(step and 3000 <= step[-1] <= 6000, f"paging did not land mid-file (match {step[-1:]})")
+        key(ESC, "closing the band")
+        key("\x1b[D", "dropping the match selection")  # `x` types at the cursor, not over the match
+        timed("editor_type_mid", "x", expect="●")
+        leave()
+    except BenchError as e:
+        print(f"  !! editor scenarios stopped: {e}", file=sys.stderr)
+        FAILED.append(str(e))
+    finally:
+        s.close()
+    with open(path, "rb") as f:
+        if hashlib.sha256(f.read()).hexdigest() != before:
+            print(f"  !! {editor_file} changed on disk: the benchmark must never write", file=sys.stderr)
+            FAILED.append(f"{editor_file} changed on disk")
+    return results
+
+
+def run_bench(binary, repo, label, iters, editor_file=None):
     s = Session(binary, repo)
     s.settle()  # initial frame + startup reload
     results = []
@@ -236,6 +383,8 @@ def run_bench(binary, repo, label, iters):
     # All files: expand into the tree first so `f` walks real source files.
     scenario("file_next_all_files", "f", prep=["2", "j", "\x1b[C", "j", "\x1b[C", "j"])
     s.close()
+    if editor_file:
+        results.extend(run_editor_bench(binary, repo, iters, editor_file))
     return {"label": label, "repo": repo, "iterations": iters, "results": results}
 
 
@@ -255,6 +404,9 @@ def main():
     ap.add_argument("--label", action="append", default=[], help="label for each --repo")
     ap.add_argument("--fixture", action="store_true", help="include the pinned synthetic repo")
     ap.add_argument("--fixture-dir", default=None)
+    ap.add_argument("--editor-file", default=None,
+                    help="big source file (repo-relative) for the editor scenarios on each --repo; "
+                         "without it a --repo skips them. The fixture always uses its own")
     ap.add_argument("--iterations", type=int, default=10)
     ap.add_argument("--json", dest="json_out", default=None)
     args = ap.parse_args()
@@ -266,9 +418,10 @@ def main():
         )
         print(f"fixture: {fd}", file=sys.stderr)
         build_fixture(fd)
-        targets.append((fd, "fixture"))
+        targets.append((fd, "fixture", FIXTURE_EDITOR_FILE))
     for i, r in enumerate(args.repo):
-        targets.append((r, args.label[i] if i < len(args.label) else os.path.basename(r)))
+        targets.append((r, args.label[i] if i < len(args.label) else os.path.basename(r),
+                        args.editor_file))
     if not targets:
         ap.error("nothing to benchmark: pass --fixture and/or --repo")
 
@@ -280,9 +433,9 @@ def main():
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     out = {"meta": meta, "runs": []}
-    for repo, label in targets:
+    for repo, label, editor_file in targets:
         print(f"\n== {label} ({repo}) ==")
-        run = run_bench(args.binary, repo, label, args.iterations)
+        run = run_bench(args.binary, repo, label, args.iterations, editor_file)
         out["runs"].append(run)
         for r in run["results"]:
             fb, p, c = r["first_byte"], r["painted"], r["cold"]
@@ -295,7 +448,11 @@ def main():
         with open(args.json_out, "w") as f:
             json.dump(out, f, indent=1)
         print(f"\nwrote {args.json_out}")
+    if FAILED:
+        print(f"\nFAILED: {'; '.join(FAILED)}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

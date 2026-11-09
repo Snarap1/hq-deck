@@ -40,6 +40,9 @@ One binary, one git worktree per process (`hq-deck [repo]`).
   `cargo run --release --example bench_latency -- <repo>` attributes a slow number to its component calls.
   The one committed baseline is `scripts/bench-results/baseline.json`; replace it when a change moves the numbers, never add per-round runs.
   Run before and after any change to the reload, render, git, or highlight paths.
+  The `editor_*` scenarios (open by `e`, `pgdn`, `ctrl+f` open, a query matching every line, `enter` between matches, a typed character mid-file) run in a second session on the fixture's `src/generated.rs` and cover the built-in editor's render and incremental highlight.
+  Run it detached too (`setsid ... < /dev/null`), since the exit code is 1 when a scenario never reached the editor or the file changed on disk; the script never presses `ctrl+s` and discards (`d`) an edit on close.
+  For a real repo, `--editor-file <path>` picks the big file; without it `--repo` skips them.
   Compare medians A/B under the same load: build the old binary to a second target dir and interleave runs.
 
 ## Invariants
