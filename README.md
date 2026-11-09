@@ -392,6 +392,8 @@ diff back. The keys are micro's, and every letter is text:
 |-----|--------|
 | arrows, `home`/`end`, `pgup`/`pgdn` | Move (`ctrl+←/→` by word, `ctrl+home/end` to the ends) |
 | `shift` + a move, or a mouse drag | Select |
+| double click / triple click | Select the word / the line |
+| `ctrl+f` | Find in the buffer |
 | `ctrl+s` | Save |
 | `ctrl+z` / `ctrl+y` | Undo / redo |
 | `ctrl+c` / `ctrl+x` / `ctrl+v` | Copy / cut / paste (the line, with nothing selected) |
@@ -404,6 +406,12 @@ diff back. The keys are micro's, and every letter is text:
 `changed on disk` as soon as the poll notices, before you save. A file that is binary, not
 UTF-8, too large for the read pane, or mixes `\n` and `\r\n` line endings does not open, and the
 footer says why.
+
+`ctrl+f` opens a find band at the foot of the editor, like the read pane's.
+Every match is marked as you type, smart-case, and the band counts them.
+`enter` or `↓` selects the next match, `↑` the previous, wrapping at both ends.
+While the band is open the keys type into the query, so the text cannot change.
+`esc` closes it and you are editing again, with the last match still selected.
 
 Set `editor` to use your own editor instead. hq-deck does not read `$EDITOR` or `$VISUAL`, so the
 key behaves the same however the pane was started. A bare command opens at the right line: it
@@ -525,7 +533,11 @@ The known constraints:
 **Review model**
 - **Comments are in-memory and single-session** - quitting loses any you haven't copied out.
 - **Sending is all-or-nothing** - `s` and `y` deliver the whole set and clear it. A failure leaves everything in place.
-- **No line-number rebasing** — a comment stays locatable by its diff snippet, not its line
+- **Content comments follow their file** - a comment made in the File view or the markdown preview moves with every edit to its file, the agent's and your own.
+  Lines added above push it down, and a rewritten line carries it along.
+  If every line it was on is deleted, it stays on the line above the gap, marked `(since removed)`, and its snippet still says what those lines were.
+  A send always gives the agent the line numbers of the file as it is on disk.
+- **Diff comments are not rebased** - a diff comment stays locatable by its diff snippet, not its line
   number. hq-deck flags a stale comment instead of dropping it.
 
 **SCM and Git ops**

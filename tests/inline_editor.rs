@@ -367,3 +367,151 @@ fn the_editor_takes_the_whole_body_where_scm_mode_has_no_read_pane() {
     let out = render(&app, 50, 20);
     assert!(out.contains("alpha"));
 }
+
+/// The editor open on a `find.rs` holding three `foo`s, at its first line.
+fn editing_three_foos() -> (Repo, App) {
+    let r = repo();
+    r.write("find.rs", "foo bar\nbaz foo\nfoo\n");
+    let mut app = app_on(&r);
+    app.open_inline_editor(&hq_deck::app::EditTarget { path: "find.rs".into(), line: 1 });
+    assert_eq!(app.mode, Mode::Editing);
+    (r, app)
+}
+
+/// The selection as `(line, col, line, col)`.
+fn selected(app: &App) -> Option<(usize, usize, usize, usize)> {
+    let (a, b) = app.edit.as_ref()?.buffer.selection()?;
+    Some((a.line, a.col, b.line, b.col))
+}
+
+fn find_count(app: &App) -> Option<(Option<usize>, usize)> {
+    app.edit.as_ref()?.find_count()
+}
+
+#[test]
+fn ctrl_f_steps_through_the_matches_and_esc_returns_to_editing() {
+    let (_r, mut app) = editing_three_foos();
+    ctrl(&mut app, 'f');
+    assert!(app.edit_finding());
+    type_text(&mut app, "foo");
+    assert_eq!(find_count(&app), Some((None, 3)), "typing counts, the cursor stays");
+    assert_eq!(selected(&app), None);
+
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(selected(&app), Some((0, 0, 0, 3)));
+    assert_eq!(find_count(&app), Some((Some(1), 3)));
+    press(&mut app, KeyCode::Down);
+    assert_eq!(selected(&app), Some((1, 4, 1, 7)));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(selected(&app), Some((2, 0, 2, 3)));
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(selected(&app), Some((0, 0, 0, 3)), "the steps wrap forward");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(selected(&app), Some((2, 0, 2, 3)), "and back");
+    assert_eq!(app.edit.as_ref().unwrap().buffer.cursor().line, 2, "the cursor is on the match");
+
+    press(&mut app, KeyCode::Esc);
+    assert!(!app.edit_finding());
+    assert_eq!(app.mode, Mode::Editing, "`esc` closes the band, not the editor");
+    type_text(&mut app, "X");
+    assert_eq!(editor_lines(&app), ["foo bar", "baz foo", "X"], "typing replaces the match");
+}
+
+#[test]
+fn the_find_band_holds_the_buffer_still() {
+    let (_r, mut app) = editing_three_foos();
+    ctrl(&mut app, 'f');
+    // Every key that would edit the text edits the query, or nothing.
+    type_text(&mut app, "q2e");
+    for code in [KeyCode::Backspace, KeyCode::Tab, KeyCode::Delete] {
+        press(&mut app, code);
+    }
+    for ch in ['x', 'v', 'z', 'y', 'd', 'k', 's'] {
+        ctrl(&mut app, ch);
+    }
+    app.input_paste("pasted\ntext");
+    assert_eq!(editor_lines(&app), ["foo bar", "baz foo", "foo"]);
+    let session = app.edit.as_ref().unwrap();
+    assert!(!session.is_dirty());
+    assert_eq!(
+        session.find.as_ref().unwrap().query,
+        "q2pasted text",
+        "the query took the keys, and a paste as one line"
+    );
+    // An edit reaching the session another way is dropped too.
+    app.edit_act(hq_deck::edit_session::EditAction::Type('!'));
+    assert_eq!(editor_lines(&app)[0], "foo bar");
+}
+
+#[test]
+fn the_find_band_is_smart_case_and_counts_no_matches() {
+    let (_r, mut app) = editing_three_foos();
+    ctrl(&mut app, 'f');
+    type_text(&mut app, "Foo");
+    assert_eq!(find_count(&app), Some((None, 0)), "an uppercase letter makes it case-sensitive");
+    let bands: Vec<FooterAction> = app.footer_bands().iter().map(|&(a, _)| a).collect();
+    assert_eq!(bands, [FooterAction::CloseFind], "no step is offered with nothing to step to");
+    for _ in 0..3 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    type_text(&mut app, "foo");
+    let bands: Vec<FooterAction> = app.footer_bands().iter().map(|&(a, _)| a).collect();
+    assert_eq!(bands, [FooterAction::FindStep, FooterAction::CloseFind]);
+}
+
+#[test]
+fn the_find_band_paints_at_the_foot_of_the_editor_with_the_matches_marked() {
+    let (_r, mut app) = editing_three_foos();
+    app.settle_edit_view(30, 60);
+    let out = render(&app, 120, 40);
+    assert!(out.contains("^F find"), "the editor's bar offers find");
+    ctrl(&mut app, 'f');
+    type_text(&mut app, "foo");
+    press(&mut app, KeyCode::Enter);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal.draw(|f| hq_deck::ui::render(f, &app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let (text, _) = hq_deck::ui::edit_text_geometry(AREA, &app).unwrap();
+    let row = |y: u16| -> String {
+        (text.x..text.x + text.width).map(|x| buffer.cell((x, y)).unwrap().symbol()).collect()
+    };
+    let band = row(text.y + text.height);
+    assert!(band.contains("1/3"), "the band's count, on the row under the text: {band:?}");
+    let current = buffer.cell((text.x, text.y)).unwrap().bg;
+    let other = buffer.cell((text.x + 4, text.y + 1)).unwrap().bg;
+    let plain = buffer.cell((text.x + 4, text.y)).unwrap().bg;
+    assert_ne!(current, other, "the current match stands out from the others");
+    assert_ne!(other, plain, "every match is marked");
+    let out = render(&app, 120, 40);
+    assert!(out.contains("↑↓ move"), "the footer is the band's");
+}
+
+#[test]
+fn a_double_click_selects_the_word_and_a_triple_click_the_line() {
+    let (_r, mut app) = editing_three_foos();
+    let (text, _) = hq_deck::ui::edit_text_geometry(AREA, &app).unwrap();
+    let at = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+    let click = |app: &mut App, column, row| {
+        for kind in [MouseEventKind::Down(MouseButton::Left), MouseEventKind::Up(MouseButton::Left)]
+        {
+            handle_mouse(
+                app,
+                at(kind, column, row),
+                AREA,
+                &[],
+                &Keymap::default(),
+                &hq_deck::export::Clipboard,
+            )
+            .unwrap();
+        }
+    };
+    // `baz foo`, on the `o` of `foo`.
+    click(&mut app, text.x + 5, text.y + 1);
+    assert_eq!(selected(&app), None);
+    click(&mut app, text.x + 5, text.y + 1);
+    assert_eq!(selected(&app), Some((1, 4, 1, 7)), "a double click takes `foo`");
+    click(&mut app, text.x + 5, text.y + 1);
+    assert_eq!(selected(&app), Some((1, 0, 2, 0)), "a triple click takes the line and its break");
+    click(&mut app, text.x + 1, text.y);
+    assert_eq!(selected(&app), None, "a click elsewhere starts over");
+}

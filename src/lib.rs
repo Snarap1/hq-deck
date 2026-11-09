@@ -1322,8 +1322,9 @@ fn event_loop(
                         );
                     }
                     // Bracketed paste: into the built-in editor's buffer, or at the caret
-                    // while composing, ignored otherwise.
-                    Event::Paste(text) if app.mode == Mode::Editing => {
+                    // while composing or in a query (the editor's find band's too), ignored
+                    // otherwise.
+                    Event::Paste(text) if app.mode == Mode::Editing && !app.edit_finding() => {
                         app.edit_act(crate::edit_session::EditAction::Paste(text));
                     }
                     Event::Paste(text) => {
@@ -1374,6 +1375,9 @@ fn event_loop(
                 // The file under the built-in editor is checked against the disk, so the
                 // title says when the agent wrote it before a save would have to ask.
                 app.check_edit_disk();
+                // Content comments follow their files' edits, the agent's included, on every
+                // tab: the comments list and the header read them wherever the reviewer is.
+                app.carry_comments();
                 logln!(
                     "poll files={} composing={} diff_cursor={} scroll={}",
                     app.entries.len(),
@@ -1645,10 +1649,22 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    // The find band, like the read pane's: the keys edit the query, the steps select the
+    // matches, `esc` returns to editing. Every other key is inert, so the buffer holds still.
+    if app.edit_finding() {
+        match key.code {
+            Esc => app.edit_close_find(),
+            Enter | Down => app.edit_find_step(1),
+            Up => app.edit_find_step(-1),
+            code => apply_text_edit(app, code, ctrl, alt, ctrl || alt),
+        }
+        return;
+    }
     let action = match key.code {
         Esc => return app.edit_close(),
         Char('q') if ctrl => return app.edit_close(),
         Char('s') if ctrl => return app.edit_save(),
+        Char('f') if ctrl => return app.edit_open_find(),
         Char('c') if ctrl => {
             if let Some(text) = app.edit_copy() {
                 copy_from_editor(app, &text);
@@ -1718,16 +1734,32 @@ fn handle_edit_mouse(app: &mut App, m: MouseEvent, area: Rect) {
         let col = m.column.saturating_sub(text.x);
         (row as usize, col as usize)
     };
-    let Some(session) = app.edit.as_mut() else { return };
-    if session.confirm.is_some() {
+    if app.edit.as_ref().is_none_or(|s| s.confirm.is_some()) {
         return;
     }
+    // The multi-click chain, keyed by the buffer line under the pointer so a scroll between
+    // the clicks breaks it.
+    let clicks = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) if inside => {
+            let line = app.edit.as_ref().map_or(0, |s| s.scroll) + cell(m).0;
+            app.note_click(m.column, m.row, line)
+        }
+        _ => 0,
+    };
+    let Some(session) = app.edit.as_mut() else { return };
     match m.kind {
         MouseEventKind::Down(MouseButton::Left) if inside => {
             let (row, col) = cell(m);
             let extend = m.modifiers.contains(KeyModifiers::SHIFT);
-            session.drag = true;
-            session.act(E::Click { row, col, extend });
+            // A double click takes the word, a triple the line; a drag extends only from a
+            // single click, so a jitter after a double click keeps the word.
+            session.drag = extend || clicks == 1;
+            session.act(match clicks {
+                _ if extend => E::Click { row, col, extend },
+                2 => E::SelectWord { row, col },
+                3 => E::SelectLine { row },
+                _ => E::Click { row, col, extend },
+            });
         }
         MouseEventKind::Drag(MouseButton::Left) if session.drag => {
             let (row, col) = cell(m);

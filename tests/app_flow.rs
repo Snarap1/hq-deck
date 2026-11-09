@@ -2800,6 +2800,8 @@ fn changed_count_and_staleness_stay_scope_based_on_all_files() {
         text: "?".into(),
         diff_anchored: true,
         rev: hq_deck::model::Rev::Worktree,
+        basis: None,
+        orphaned: false,
     };
     app.store.add(comment.clone());
 

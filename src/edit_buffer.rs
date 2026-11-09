@@ -304,6 +304,43 @@ impl Buffer {
         self.move_to(Pos::new(line, col), extend);
     }
 
+    /// Select `start..end` (both clamped) with the cursor at `end`, as a find step does.
+    pub fn select(&mut self, start: Pos, end: Pos) {
+        self.move_to(start, false);
+        self.move_to(end, true);
+    }
+
+    /// Select the run of one character class under a display column of `line`, as a double
+    /// click does: a word, a run of punctuation, or a run of blanks. Past the line's end it is
+    /// the last run; an empty line selects nothing and leaves the cursor at its start.
+    pub fn select_word(&mut self, line: usize, display_col: usize) {
+        let line = line.min(self.lines.len() - 1);
+        let chars: Vec<char> = self.lines[line].chars().collect();
+        if chars.is_empty() {
+            self.move_to(Pos::new(line, 0), false);
+            return;
+        }
+        let at = self.col_at_display(line, display_col).min(chars.len() - 1);
+        let class = char_class(chars[at]);
+        let start = (0..at).rev().take_while(|&i| char_class(chars[i]) == class).last();
+        let end = (at..chars.len()).take_while(|&i| char_class(chars[i]) == class).last();
+        let (start, end) = (start.unwrap_or(at), end.unwrap_or(at) + 1);
+        self.select(Pos::new(line, start), Pos::new(line, end));
+    }
+
+    /// Select `line` (clamped) whole, as a triple click does: through its line break to the
+    /// next line's start, or to its end on the last line, so a cut takes the line.
+    pub fn select_line(&mut self, line: usize) {
+        // Clamped like a click: a triple click below the last line takes the last line.
+        let line = line.min(self.lines.len() - 1);
+        let end = if line + 1 < self.lines.len() {
+            Pos::new(line + 1, 0)
+        } else {
+            Pos::new(line, self.line_len(line))
+        };
+        self.select(Pos::new(line, 0), end);
+    }
+
     fn vertical(&mut self, line: usize, extend: bool) {
         let goal = self.goal.unwrap_or_else(|| self.display_col(self.cursor));
         let col = self.col_at_display(line, goal);
@@ -797,6 +834,44 @@ mod tests {
 
     fn buf(text: &str) -> Buffer {
         Buffer::parse(text.as_bytes()).unwrap()
+    }
+
+    /// The selected text, `None` with nothing selected.
+    fn selected_text(b: &Buffer) -> Option<String> {
+        b.selection().map(|_| b.copy_text())
+    }
+
+    #[test]
+    fn a_word_selection_takes_one_run_of_a_character_class() {
+        let mut b = buf("let foo_1 = a.b;   x\n\n");
+        b.select_word(0, 5);
+        assert_eq!(selected_text(&b).as_deref(), Some("foo_1"));
+        assert_eq!(b.cursor(), Pos::new(0, 9), "the cursor ends the word");
+        b.select_word(0, 15);
+        assert_eq!(selected_text(&b).as_deref(), Some(";"), "punctuation is its own run");
+        b.select_word(0, 17);
+        assert_eq!(selected_text(&b).as_deref(), Some("   "), "and so are blanks");
+        b.select_word(0, 99);
+        assert_eq!(selected_text(&b).as_deref(), Some("x"), "past the end is the last run");
+        b.select_word(1, 3);
+        assert_eq!(b.selection(), None, "an empty line has no word");
+        assert_eq!(b.cursor(), Pos::new(1, 0));
+    }
+
+    #[test]
+    fn a_word_selection_counts_display_columns_past_a_tab() {
+        let mut b = buf("\tab cd\n");
+        b.select_word(0, 4); // the tab spans columns 0..4, so 4 is `a`
+        assert_eq!(selected_text(&b).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn a_line_selection_takes_the_break_except_on_the_last_line() {
+        let mut b = buf("one\ntwo");
+        b.select_line(0);
+        assert_eq!(b.selection(), Some((Pos::new(0, 0), Pos::new(1, 0))));
+        b.select_line(9);
+        assert_eq!(b.selection(), Some((Pos::new(1, 0), Pos::new(1, 3))), "clamped to the last");
     }
 
     /// The buffer's text with `|` at the cursor, for compact assertions.

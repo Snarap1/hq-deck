@@ -56,11 +56,13 @@ Load-bearing. Cite them by name.
   The boundary must not drift further without an explicit decision.
 - **Comments survive**: comments are never lost to a refresh or the agent's edits, and leave only by an explicit successful export (`s` send, `y` copy).
   The comment store is in-memory by design - do not propose persisting it.
+  A content comment's lines follow its file (`CommentStore::rebase`, by line diff from the text they count in): an edit never drops one, and one whose lines were all deleted stays on the line above the gap, `orphaned`, with its snippet.
   The built-in editor's unsaved text holds to the same rule: no poll, refresh, agent write, or config recovery touches the buffer, and it leaves only by a save, an explicit discard (`d`), or a reload the user answered (`r`).
   The one quit reachable while it is open, the blocked config screen's `q`, says on that screen that it discards the edit.
 - **Continuity**: place state (cursor, scroll, tab, scope, folds, selection, layout) moves only under the user's own input.
   World events (polls, refreshes, fetch results) may only reconcile it: match by identity first (path, comment author+anchor, never row index), fall back to the nearest surviving target, clamp last.
   Derived state on screen may be stale, never wrong: blank a view only when its identity changed, never because the same thing gained newer content.
+  A file a read pane paints (the open view, or the other file tab's stash) carries its content comments only with that view's own rebuild, so a held view's cards stay on the rows it painted; the poll carries every other file (`App::carry_comments`), and an export carries copies to the disk.
 
 ## Architecture
 
@@ -119,6 +121,7 @@ World results land through `land_world_completion`: input-tagged, latest-wins, r
   GitHub and GitLab are the only forges.
 - `src/model.rs` - `CommentStore` (in-memory) and comment anchoring.
   `diff_anchored` separates diff comments from content comments; each renders only in its own view.
+  A content comment holds its `Basis`, the worktree text its numbers count in, taken from the `FileDiff::worktree` it was made over; `rebase` carries it to a newer version and is pure.
   A diff row (`Changes`, file tree or SCM mode, which pins the `uncommitted` scope) makes a diff comment.
   The File view and the markdown preview paint current worktree content, so they make content comments.
   Staging changes neither: the `uncommitted` diff is `HEAD` vs the worktree, which a stage does not move.
@@ -133,6 +136,7 @@ World results land through `land_world_completion`: input-tagged, latest-wins, r
   The per-line highlight (`highlight::LineHighlights`) lives in a thread-local keyed by session, not in the session: syntect's parser state is `!Send` under oniguruma, and `App` must be `Send` for config recovery.
   The cache is derived, so a missing entry is rebuilt from the text.
   Keys are fixed (micro's) and dispatched by `handle_edit_key` in `lib.rs`, not the keymap; only `e` itself is rebindable.
+  Its `ctrl+f` find band (`EditFind`) types into a query through the shared field ops and only moves the selection: while it is open `act` drops every text-changing gesture, so its matches stay true.
 - `src/export.rs` - comment formatting (`format_all`) and the `ExportTarget` trait, plus the clipboard target: `wl-copy`/`xclip`/`xsel` on a local display, OSC 52 over ssh or with no display (and as the fallback when a tool fails).
   OSC 52 has no acknowledgement, so it counts as success once written to a terminal stdout.
   `App::export` consumes comments only on `Ok`.

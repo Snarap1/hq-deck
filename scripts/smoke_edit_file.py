@@ -461,6 +461,20 @@ def main():
             saved = f.read()
         check("ctrl+s writes the worktree", saved == "Zone\nTWO\nthree\nfour\nfive\n",
               f"file={saved!r}")
+        # `ctrl+f` reaches the editor through the terminal as its own byte, opens the find band,
+        # and the keys type into the query, not the buffer.
+        band = s.press("\x06")  # ctrl+f
+        check("ctrl+f opens the editor's find band", b"find in buffer" in plain(band))
+        counted = s.press("four")
+        check("the band counts the query's matches", b"1" in plain(counted))
+        # Off a match the count is the total, `1`; on it `1/1`. The frame diff repaints only the
+        # cells that changed, so the step sends the `1/` that grew in front of the total.
+        stepped = s.press("\r")
+        check("enter steps to the match and counts it", b"1/" in plain(stepped),
+              "the band never said 1/1")
+        with open(builtin_file) as f:
+            check("the find band leaves the buffer alone", f.read() == saved)
+        s.press("\x1b")  # closes the band; the buffer is still the saved one
         s.press("\x1b")
         # `q` is text inside the editor, so a clean exit on it proves `esc` closed the editor.
         s.press("q")

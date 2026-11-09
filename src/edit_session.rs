@@ -117,8 +117,72 @@ pub enum EditAction {
         col: usize,
         extend: bool,
     },
+    /// A double click: the word (or run of punctuation or blanks) under the cell.
+    SelectWord {
+        row: usize,
+        col: usize,
+    },
+    /// A triple click: the whole line at the row, with its line break.
+    SelectLine {
+        row: usize,
+    },
     /// The wheel: scroll the view by rows, leaving the cursor where it is.
     Scroll(isize),
+}
+
+impl EditAction {
+    /// Whether the gesture can change the text, rather than only the cursor, the selection, or
+    /// the view.
+    pub fn edits(&self) -> bool {
+        match self {
+            Self::Type(_)
+            | Self::Paste(_)
+            | Self::Newline
+            | Self::Tab
+            | Self::BackTab
+            | Self::Backspace
+            | Self::Delete
+            | Self::DeleteWordBack
+            | Self::Undo
+            | Self::Redo
+            | Self::Duplicate => true,
+            Self::Left { .. }
+            | Self::Right { .. }
+            | Self::Up { .. }
+            | Self::Down { .. }
+            | Self::PageUp { .. }
+            | Self::PageDown { .. }
+            | Self::Home { .. }
+            | Self::End { .. }
+            | Self::DocStart { .. }
+            | Self::DocEnd { .. }
+            | Self::SelectAll
+            | Self::Click { .. }
+            | Self::SelectWord { .. }
+            | Self::SelectLine { .. }
+            | Self::Scroll(_) => false,
+        }
+    }
+}
+
+/// The find band over the editor, open from `ctrl+f` until `esc`. It reads the buffer and moves
+/// only the selection, so no text changes while it is open: the keys that would edit go to the
+/// query instead.
+#[derive(Clone, Debug, Default)]
+pub struct EditFind {
+    pub query: String,
+    /// The caret into `query`: a char index, edited by the shared caret ops.
+    pub caret: usize,
+    /// Every match of `query` in buffer order, as `(start, end)`. Recomputed when the query
+    /// changes ([`EditSession::refresh_find`]), which is the only thing that can change it while
+    /// the band holds the buffer still.
+    matches: Vec<(Pos, Pos)>,
+}
+
+impl EditFind {
+    pub fn matches(&self) -> &[(Pos, Pos)] {
+        &self.matches
+    }
 }
 
 /// The file's identity on disk at a point in time: cheap to read on every poll, and enough to
@@ -160,6 +224,8 @@ pub struct EditSession {
     pub confirm: Option<Confirm>,
     /// A left-button drag that started in the text, extending the selection until release.
     pub drag: bool,
+    /// The find band, while it is open.
+    pub find: Option<EditFind>,
 }
 
 impl EditSession {
@@ -194,6 +260,7 @@ impl EditSession {
             disk: Disk::Same,
             confirm: None,
             drag: false,
+            find: None,
         })
     }
 
@@ -201,8 +268,13 @@ impl EditSession {
         self.buffer.is_dirty()
     }
 
-    /// Apply one gesture to the buffer and keep the highlight aligned with the text.
+    /// Apply one gesture to the buffer and keep the highlight aligned with the text. While the
+    /// find band is open, a gesture that would change the text is dropped: the band holds the
+    /// buffer still, so its matches stay true.
     pub fn act(&mut self, action: EditAction) {
+        if self.find.is_some() && action.edits() {
+            return;
+        }
         let b = &mut self.buffer;
         let page = self.viewport.0.saturating_sub(1).max(1);
         let mut reveal = true;
@@ -242,6 +314,10 @@ impl EditSession {
             EditAction::Click { row, col, extend } => {
                 b.click(self.scroll + row, self.h_scroll + col, extend);
             }
+            EditAction::SelectWord { row, col } => {
+                b.select_word(self.scroll + row, self.h_scroll + col);
+            }
+            EditAction::SelectLine { row } => b.select_line(self.scroll + row),
             EditAction::Scroll(delta) => {
                 self.scroll = self.scroll.saturating_add_signed(delta);
                 reveal = false;
@@ -256,12 +332,76 @@ impl EditSession {
         self.buffer.copy_text()
     }
 
-    /// `cut`: remove and return the selection, or the cursor's line.
+    /// `cut`: remove and return the selection, or the cursor's line. Inert, returning nothing,
+    /// while the find band holds the buffer still.
     pub fn cut(&mut self) -> String {
+        if self.find.is_some() {
+            return String::new();
+        }
         let text = self.buffer.cut();
         self.reveal = true;
         self.sync_highlight();
         text
+    }
+
+    /// `ctrl+f`: open the find band with an empty query. Already open, it stays as it is.
+    pub fn open_find(&mut self) {
+        self.find.get_or_insert_with(EditFind::default);
+    }
+
+    /// `esc` in the band: close it, dropping the query. A match a step selected stays
+    /// selected, so typing next replaces it.
+    pub fn close_find(&mut self) {
+        self.find = None;
+    }
+
+    /// Recompute the band's matches against the buffer, after its query changed. Smart-case,
+    /// like the read pane's find band.
+    pub fn refresh_find(&mut self) {
+        let Some(find) = self.find.as_mut() else { return };
+        find.matches.clear();
+        if find.query.is_empty() {
+            return;
+        }
+        let case_sensitive = crate::app::find_case_sensitive(&find.query);
+        for (line, text) in self.buffer.lines().iter().enumerate() {
+            for (start, end) in crate::app::find_match_ranges(text, &find.query, case_sensitive) {
+                find.matches.push((Pos::new(line, start as usize), Pos::new(line, end as usize)));
+            }
+        }
+    }
+
+    /// The index of the match the selection is, if it is one: the band's current match.
+    pub fn current_match(&self) -> Option<usize> {
+        let find = self.find.as_ref()?;
+        let selection = self.buffer.selection()?;
+        find.matches.iter().position(|&m| m == selection)
+    }
+
+    /// `enter`/`↓` (`delta > 0`) and `↑` (`delta < 0`): select the next or previous match from
+    /// the current one, or from the cursor off a match, wrapping at both ends. Inert while
+    /// nothing matches.
+    pub fn find_step(&mut self, delta: i32) {
+        let current = self.current_match();
+        let Some(find) = self.find.as_ref().filter(|f| !f.matches.is_empty()) else { return };
+        let len = find.matches.len();
+        let cursor = self.buffer.cursor();
+        let target = match current {
+            Some(i) if delta > 0 => (i + 1) % len,
+            Some(i) => (i + len - 1) % len,
+            None if delta > 0 => find.matches.iter().position(|m| m.0 >= cursor).unwrap_or(0),
+            None => find.matches.iter().rposition(|m| m.0 < cursor).unwrap_or(len - 1),
+        };
+        let (start, end) = find.matches[target];
+        self.buffer.select(start, end);
+        self.reveal = true;
+    }
+
+    /// The band's count: the current match's 1-based ordinal (`None` off a match) and the
+    /// total. `None` while the band is closed or its query is empty.
+    pub fn find_count(&self) -> Option<(Option<usize>, usize)> {
+        let find = self.find.as_ref().filter(|f| !f.query.is_empty())?;
+        Some((self.current_match().map(|i| i + 1), find.matches.len()))
     }
 
     /// Bring the scroll in line with the viewport the frame is about to paint: the cursor into
@@ -389,6 +529,9 @@ impl EditSession {
         self.disk_bytes = bytes;
         self.disk = Disk::Same;
         self.reveal = true;
+        // A reload is answered from a question the band never coexists with, but its matches
+        // must describe the text either way.
+        self.refresh_find();
         Ok(())
     }
 

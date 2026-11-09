@@ -11,6 +11,7 @@ use std::path::Path;
 use similar::{ChangeTag, TextDiff};
 
 use crate::highlight::Highlighter;
+use crate::model::Basis;
 
 /// An 8-bit RGB color.
 pub type Rgb = (u8, u8, u8);
@@ -136,6 +137,11 @@ pub struct FileDiff {
     pub state: FileState,
     pub view: View,
     pub rows: Vec<Row>,
+    /// The worktree text the rows' new-side numbers count in, when the new side is the
+    /// worktree's: the File view, and a worktree scope's diff (the app sets that one). `None`
+    /// for a commit's diff, a notice, and the placeholder. A content comment made over these
+    /// rows counts its lines in it, and the comments on a file move with it while it is shown.
+    pub worktree: Option<Basis>,
 }
 
 /// A file beyond either budget renders as `too_large` rather than stalling the diff —
@@ -166,6 +172,7 @@ impl FileDiff {
             state: FileState::Normal,
             view: View::Diff,
             rows: Vec::new(),
+            worktree: None,
         }
     }
 
@@ -185,6 +192,7 @@ impl FileDiff {
             state,
             view: View::Diff,
             rows: Vec::new(),
+            worktree: None,
         };
         if old.contains('\0') || new.contains('\0') {
             return notice(FileState::Binary);
@@ -236,6 +244,7 @@ impl FileDiff {
             state: FileState::Normal,
             view: View::Diff,
             rows: collapse_context(&rows),
+            worktree: None,
         }
     }
 
@@ -249,6 +258,7 @@ impl FileDiff {
             state,
             view: View::File,
             rows: Vec::new(),
+            worktree: None,
         };
         if content.contains('\0') {
             return notice(FileState::Binary);
@@ -269,7 +279,14 @@ impl FileDiff {
                 }
             })
             .collect();
-        Self { path, previous_path: None, state: FileState::Normal, view: View::File, rows }
+        Self {
+            path,
+            previous_path: None,
+            state: FileState::Normal,
+            view: View::File,
+            rows,
+            worktree: Some(Basis::new(content)),
+        }
     }
 
     /// The File-view `too_large` notice, for an over-budget file the caller declines to read.
@@ -281,6 +298,7 @@ impl FileDiff {
             state: FileState::TooLarge,
             view: View::File,
             rows: Vec::new(),
+            worktree: None,
         }
     }
 }

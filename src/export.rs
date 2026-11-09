@@ -249,6 +249,8 @@ mod tests {
             text: text.into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            basis: None,
+            orphaned: false,
         }
     }
 

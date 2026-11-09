@@ -19,7 +19,7 @@ use crate::forge;
 use crate::git;
 use crate::highlight::Highlighter;
 use crate::logln;
-use crate::model::{Comment, CommentStore, CommitPick, Rev, Scope, Side};
+use crate::model::{Basis, Comment, CommentStore, CommitPick, Rev, Scope, Side};
 use crate::theme::{self, Palette};
 use crate::world::{PickStatus, PickVerdict};
 
@@ -704,11 +704,12 @@ pub enum FooterAction {
     Refresh,
     Tabs,
     Quit,
-    /// The built-in editor's own bar: save, close, undo, and the clipboard trio.
+    /// The built-in editor's own bar: save, close, undo, the clipboard trio, and find.
     EditSave,
     EditClose,
     EditUndo,
     EditClipboard,
+    EditFind,
     /// The editor's answers: closing with unsaved text (`s`/`d`/`esc`), and saving over a file
     /// that changed on disk (`o`/`r`/`esc`).
     EditAnswerSave,
@@ -1616,6 +1617,11 @@ impl App {
         self.diff_path = Some(path.clone());
         let (old, new) = self.content_sides(&path, previous_path.as_deref());
         self.diff = self.cache.get(path, previous_path, &old, &new, &self.highlighter);
+        // A worktree scope's new side is the file on disk; a commit's is not.
+        if self.scope != Scope::Commits && self.diff.state == crate::diff::FileState::Normal {
+            self.diff.worktree = Some(Basis::new(&new));
+        }
+        self.carry_to_shown();
         // Hold the new side as the preview's render input, the same current content the File
         // view previews. A non-markdown file, a notice, or a deleted file (empty new side)
         // holds nothing, so its toggle stays inert.
@@ -1650,8 +1656,35 @@ impl App {
             self.preview_text.clear();
         }
         self.diff = diff;
+        self.carry_to_shown();
         self.rebuild_visible();
         self.settle_read();
+    }
+
+    /// Carry the content comments on the open file to the worktree text the read pane now
+    /// paints, so their cards sit on the rows the agent's or the reviewer's edit moved them to.
+    /// A file that is gone reads as empty, which is no version of it: its comments stay where
+    /// they were, stale, rather than all collapsing onto line 1.
+    fn carry_to_shown(&mut self) {
+        if let (Some(basis), Some(path)) = (&self.diff.worktree, &self.diff_path)
+            && self.repo.join(path).is_file()
+        {
+            self.store.rebase(path, basis);
+        }
+    }
+
+    /// Carry the content comments on every file no read pane paints to its text on disk, on
+    /// the poll and after a save. A painted file (the open view, or the other file tab's
+    /// stashed one) moves with its own view's rebuild instead, so its cards never leave the
+    /// rows painted under them, including while a modal holds that view still (Continuity).
+    pub fn carry_comments(&mut self) {
+        let painted =
+            |diff: &FileDiff, path: &Option<String>| diff.worktree.as_ref().and(path.clone());
+        let except = [
+            painted(&self.diff, &self.diff_path),
+            painted(&self.stash.diff, &self.stash.diff_path),
+        ];
+        carry_from_disk(&mut self.store, &self.repo, &except);
     }
 
     /// Build the read pane's File view for `path`: an over-budget blob (a model weight, a
@@ -3803,8 +3836,10 @@ impl App {
                 session.confirm = None;
                 self.status = format!("saved {}", session.path);
                 // The navigator, the diff, and the File view catch up on the refresh, like
-                // after any other write to the worktree.
+                // after any other write to the worktree, and the content comments on the file
+                // move with the edit: here unless a view paints the file, else with its rebuild.
                 self.request_world_refresh(false);
+                self.carry_comments();
                 if then_close {
                     self.finish_edit();
                 }
@@ -3851,6 +3886,32 @@ impl App {
                 }
             },
             _ => {}
+        }
+    }
+
+    /// Whether the editor's find band is open, so the keys edit its query, not the buffer.
+    pub fn edit_finding(&self) -> bool {
+        self.edit.as_ref().is_some_and(|s| s.find.is_some())
+    }
+
+    /// `ctrl+f` in the editor: open its find band. Inert while it waits on an answer.
+    pub fn edit_open_find(&mut self) {
+        if let Some(session) = self.edit.as_mut().filter(|s| s.confirm.is_none()) {
+            session.open_find();
+        }
+    }
+
+    /// `esc` in the editor's find band: back to editing.
+    pub fn edit_close_find(&mut self) {
+        if let Some(session) = self.edit.as_mut() {
+            session.close_find();
+        }
+    }
+
+    /// `enter`/`↓` and `↑` in the editor's find band.
+    pub fn edit_find_step(&mut self, delta: i32) {
+        if let Some(session) = self.edit.as_mut() {
+            session.find_step(delta);
         }
     }
 
@@ -4035,8 +4096,14 @@ impl App {
             Mode::Search => self.search.as_mut().map(|s| (&mut s.query, &mut s.caret)),
             Mode::Find => self.find.as_mut().map(|f| (&mut f.query, &mut f.caret)),
             Mode::BasePick => self.base_picker.as_mut().map(|b| (&mut b.query, &mut b.caret)),
-            // The editor's buffer is a document, not a field: it edits through `edit_act`.
-            Mode::Normal | Mode::List | Mode::CommitPick | Mode::Editing => None,
+            // The editor's buffer is a document, not a field: it edits through `edit_act`. Its
+            // find band's query is a field.
+            Mode::Editing => self
+                .edit
+                .as_mut()
+                .and_then(|s| s.find.as_mut())
+                .map(|f| (&mut f.query, &mut f.caret)),
+            Mode::Normal | Mode::List | Mode::CommitPick => None,
         }
     }
 
@@ -4064,6 +4131,12 @@ impl App {
         }
         if changed && self.mode == Mode::BasePick {
             self.refilter_base_picker(highlighted);
+        }
+        if changed
+            && self.mode == Mode::Editing
+            && let Some(session) = self.edit.as_mut()
+        {
+            session.refresh_find();
         }
     }
 
@@ -4172,7 +4245,8 @@ impl App {
         }
         let mut norm = text.replace("\r\n", "\n").replace('\r', "\n");
         match self.mode {
-            Mode::Search | Mode::Find => norm = norm.replace('\n', " "),
+            // The editor reaches here only with its find band open (`lib.rs`).
+            Mode::Search | Mode::Find | Mode::Editing => norm = norm.replace('\n', " "),
             // No branch name holds a newline, so a name pasted with the one it was copied
             // with filters as the bare name rather than matching nothing.
             Mode::BasePick => norm.retain(|c| c != '\n'),
@@ -4331,6 +4405,10 @@ impl App {
                 text,
                 diff_anchored: false,
                 rev: Rev::Worktree,
+                // The preview renders the read pane's new side, so its source lines count in
+                // the same text - none over a commit, whose preview is no worktree version.
+                basis: self.diff.worktree.clone(),
+                orphaned: false,
             });
         }
         let (side, start, end, lines) = self.selection_anchor()?;
@@ -4339,7 +4417,21 @@ impl App {
         let diff_anchored = self.diff.view == View::Diff;
         // A content comment reads the worktree whatever the scope.
         let rev = if diff_anchored { self.current_rev() } else { Rev::Worktree };
-        Some(Comment { file, side, start, end, lines, text, diff_anchored, rev })
+        // A content comment counts its lines in the text the File view painted, which may be a
+        // poll older than the disk: the next carry moves it from there.
+        let basis = if diff_anchored { None } else { self.diff.worktree.clone() };
+        Some(Comment {
+            file,
+            side,
+            start,
+            end,
+            lines,
+            text,
+            diff_anchored,
+            rev,
+            basis,
+            orphaned: false,
+        })
     }
 
     /// The `path:line` the composer is anchored to (selection for a new comment,
@@ -4366,6 +4458,8 @@ impl App {
                     text: String::new(),
                     diff_anchored: true,
                     rev: Rev::Worktree,
+                    basis: None,
+                    orphaned: false,
                 };
                 Some(c.location())
             }
@@ -5016,11 +5110,22 @@ impl App {
                         (A::EditAnswerCancel, Do),
                         (A::EditAnswerReload, Do),
                     ],
+                    // The find band owns the keys the way the read pane's does, so it offers
+                    // the same two.
+                    None if self.edit_finding() => {
+                        let count = self.edit.as_ref().and_then(EditSession::find_count);
+                        if count.is_some_and(|(_, total)| total > 0) {
+                            vec![(A::FindStep, Primary), (A::CloseFind, Do)]
+                        } else {
+                            vec![(A::CloseFind, Primary)]
+                        }
+                    }
                     None => vec![
                         (A::EditSave, Primary),
                         (A::EditClose, Do),
                         (A::EditUndo, Do),
                         (A::EditClipboard, Do),
+                        (A::EditFind, Do),
                     ],
                 };
             }
@@ -5644,7 +5749,15 @@ impl App {
             self.status = "no comments to send".to_string();
             return false;
         }
-        let refs: Vec<&Comment> = self.store.iter().collect();
+        // The agent works on the files as they are now, so each content comment goes out
+        // carried to its file on disk, even one whose view is held a poll behind. The copies
+        // carry, not the store: a failed export leaves every card on the rows it painted on.
+        let mut carried = CommentStore::new();
+        for c in self.store.iter() {
+            carried.add(c.clone());
+        }
+        carry_from_disk(&mut carried, &self.repo, &[]);
+        let refs: Vec<&Comment> = carried.iter().collect();
         let text = format_all(&refs);
         let n = refs.len();
         logln!("export ({n}) -> {} ::\n{text}", target.label());
@@ -5823,6 +5936,34 @@ fn worktree_content(repo: &std::path::Path, path: &str) -> String {
     std::fs::read(repo.join(path))
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default()
+}
+
+/// The worktree text of `path` as the File view would paint it, or `None` where it would paint
+/// no lines: the file is gone, unreadable, over the size budget, or binary.
+fn worktree_text(repo: &std::path::Path, path: &str) -> Option<String> {
+    let abs = repo.join(path);
+    let meta = std::fs::metadata(&abs).ok()?;
+    if !meta.is_file() || crate::diff::over_byte_budget(meta.len() as usize) {
+        return None;
+    }
+    let bytes = std::fs::read(&abs).ok()?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Carry the content comments in `store` to their files' text on disk, skipping the `except`
+/// paths. A file with no paintable text leaves its comments where they were.
+fn carry_from_disk(store: &mut CommentStore, repo: &std::path::Path, except: &[Option<String>]) {
+    for file in store.content_files() {
+        if except.iter().flatten().any(|p| *p == file) {
+            continue;
+        }
+        if let Some(text) = worktree_text(repo, &file) {
+            store.rebase(&file, &Basis::new(&text));
+        }
+    }
 }
 
 fn line_in(c: &Comment, row: &Row) -> bool {
@@ -6060,6 +6201,8 @@ mod tests {
             text: "saved".to_string(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            basis: None,
+            orphaned: false,
         });
         old.mode = Mode::Composing { editing: None };
         old.resume_list = true;
@@ -6330,6 +6473,8 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            basis: None,
+            orphaned: false,
         });
         app.diff_cursor = 2;
         app.start_edit();
@@ -6365,6 +6510,8 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            basis: None,
+            orphaned: false,
         });
         app.diff_cursor = 0;
         app.preview_text = "# heading".into();
@@ -6391,6 +6538,8 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            basis: None,
+            orphaned: false,
         });
         app.diff_cursor = 2;
         app.toggle_select();
@@ -6422,6 +6571,8 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            basis: None,
+            orphaned: false,
         });
         app.diff_cursor = 2;
         app.tab = super::Tab::Pr;
@@ -6443,6 +6594,8 @@ mod tests {
             text: "note".into(),
             diff_anchored: true,
             rev: crate::model::Rev::Worktree,
+            basis: None,
+            orphaned: false,
         });
         app.diff_cursor = 0;
         app.focus = crate::Focus::Files;

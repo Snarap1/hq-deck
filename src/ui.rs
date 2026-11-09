@@ -2919,14 +2919,17 @@ fn edit_pane_rect(area: Rect, app: &App) -> Rect {
 
 /// The editor's text cells (inside the border, right of the line-number gutter) and the gutter's
 /// width. One definition for the paint and for click hit-testing, so a click lands on the cell
-/// it hit. `None` while no file is open for editing.
+/// it hit. The find band, while open, takes the inner bottom row. `None` while no file is open
+/// for editing.
 pub fn edit_text_geometry(area: Rect, app: &App) -> Option<(Rect, usize)> {
     let session = app.edit.as_ref()?;
     let inner = Block::default().borders(Borders::ALL).inner(edit_pane_rect(area, app));
     let gutter = (gutter_width(session.buffer.line_count()) + 1).min(inner.width as usize);
+    let band = u16::from(session.find.is_some());
     let text = Rect {
         x: inner.x + gutter as u16,
         width: inner.width.saturating_sub(gutter as u16),
+        height: inner.height.saturating_sub(band),
         ..inner
     };
     Some((text, gutter))
@@ -2959,10 +2962,22 @@ fn render_edit_pane(frame: &mut Frame, app: &App, area: Rect) {
     let cursor = buffer.cursor();
     let selection = buffer.selection();
     let number_w = gutter.saturating_sub(1);
+    // The find band's matches on the painted lines: they are in buffer order, so the visible
+    // ones are one slice, walked once for the whole frame.
+    let found = session.find.as_ref().map_or(&[][..], |f| f.matches());
+    let current = session.current_match();
+    let lo = found.partition_point(|m| m.0.line < first);
+    let hi = found.partition_point(|m| m.0.line < last);
     let lines: Vec<Line<'static>> = app
         .with_edit_highlight(last, |highlight| {
+            let mut at = lo;
             (first..last)
                 .map(|i| {
+                    let mut hits = Vec::new();
+                    while at < hi && found[at].0.line == i {
+                        hits.push((found[at].0.col, found[at].1.col, current == Some(at)));
+                        at += 1;
+                    }
                     let number_style =
                         Style::default().fg(if i == cursor.line { p.text } else { p.dim2 });
                     let mut spans =
@@ -2970,8 +2985,7 @@ fn render_edit_pane(frame: &mut Frame, app: &App, area: Rect) {
                     spans.extend(edit_line_spans(
                         &buffer.lines()[i],
                         highlight.spans(i),
-                        i,
-                        selection,
+                        EditMarks { index: i, selection, hits: &hits },
                         session.h_scroll,
                         text.width as usize,
                         p,
@@ -2988,46 +3002,76 @@ fn render_edit_pane(frame: &mut Frame, app: &App, area: Rect) {
         render_edit_confirm(frame, app, pane, confirm);
         return;
     }
+    // The band sits on the row the text gave up, across the gutter too; the terminal cursor is
+    // its caret then, since the keys type into the query.
+    if let Some(find) = session.find.as_ref() {
+        let band = Rect { y: text.y + text.height, height: 1, ..rows };
+        let count = session.find_count();
+        find_band(frame, band, &find.query, find.caret, count, "find in buffer…", p);
+        return;
+    }
     let col = buffer.display_col(cursor);
     if (first..last).contains(&cursor.line) && col >= session.h_scroll {
         anchor_input_cursor(frame, text, col - session.h_scroll, cursor.line - first);
     }
 }
 
+/// What one editor line paints over its syntax colors: the selection, and the find band's
+/// matches on it as `(start, end, current)` char ranges.
+#[derive(Clone, Copy)]
+struct EditMarks<'a> {
+    index: usize,
+    selection: Option<(crate::edit_buffer::Pos, crate::edit_buffer::Pos)>,
+    hits: &'a [(usize, usize, bool)],
+}
+
 /// One editor line as styled spans: syntax colors (or plain text before its highlight lands),
-/// tabs expanded to their stops, control characters shown as `�`, the selection filled, and
-/// the line scrolled to `h_scroll` and cut at `width` display columns. A wide character the left
-/// edge cuts through paints as a blank, so every later cell keeps its column.
+/// tabs expanded to their stops, control characters shown as `�`, the selection filled, the
+/// find band's matches marked (the current one as the read pane's find marks it, the rest
+/// with the softer search fill), and the line scrolled to `h_scroll` and cut at `width` display
+/// columns. A wide character the left edge cuts through paints as a blank, so every later cell
+/// keeps its column.
 fn edit_line_spans(
     line: &str,
     highlight: Option<&[crate::diff::Span]>,
-    index: usize,
-    selection: Option<(crate::edit_buffer::Pos, crate::edit_buffer::Pos)>,
+    marks: EditMarks<'_>,
     h_scroll: usize,
     width: usize,
     p: &Palette,
 ) -> Vec<Span<'static>> {
     use crate::edit_buffer::{Pos, char_display_width};
-    let selected = |col: usize| {
-        selection.is_some_and(|(start, end)| {
-            let at = Pos::new(index, col);
-            start <= at && at < end
-        })
+    let EditMarks { index, selection, hits } = marks;
+    // Per char: `0` plain, `1` selected, `2` a match, `3` the current match, the strongest
+    // winning where they overlap.
+    let mark = |col: usize| {
+        let hit = hits.iter().find(|&&(s, e, _)| s <= col && col < e);
+        match hit {
+            Some(&(_, _, true)) => 3u8,
+            _ if selection.is_some_and(|(start, end)| {
+                let at = Pos::new(index, col);
+                start <= at && at < end
+            }) =>
+            {
+                1
+            }
+            Some(_) => 2,
+            None => 0,
+        }
     };
     let plain = [crate::diff::Span { text: line.to_owned(), color: (0, 0, 0) }];
     let (pieces, plain_fg) = match highlight {
         Some(spans) => (spans, None),
         None => (&plain[..], Some(p.text)),
     };
-    // (glyph, fg, selected) per display cell.
-    let mut cells: Vec<(char, Color, bool)> = Vec::new();
+    // (glyph, fg, mark) per display cell.
+    let mut cells: Vec<(char, Color, u8)> = Vec::new();
     let mut col = 0;
     let mut at = 0;
     for piece in pieces {
         let fg = plain_fg.unwrap_or_else(|| rgb(piece.color));
         for ch in piece.text.chars() {
             let w = char_display_width(ch, at);
-            let sel = selected(col);
+            let marked = mark(col);
             let glyph = if ch == '\t' {
                 ' '
             } else if ch.is_control() {
@@ -3035,10 +3079,10 @@ fn edit_line_spans(
             } else {
                 ch
             };
-            cells.push((glyph, fg, sel));
+            cells.push((glyph, fg, marked));
             // A tab's extra columns and a wide character's second column carry no glyph.
             for _ in 1..w {
-                cells.push((if ch == '\t' { ' ' } else { '\0' }, fg, sel));
+                cells.push((if ch == '\t' { ' ' } else { '\0' }, fg, marked));
             }
             at += w;
             col += 1;
@@ -3049,12 +3093,12 @@ fn edit_line_spans(
         let eol = Pos::new(index, col);
         start <= eol && eol < end
     }) {
-        cells.push((' ', p.text, true));
+        cells.push((' ', p.text, 1));
     }
     let mut out: Vec<Span<'static>> = Vec::new();
     let mut run = String::new();
     let mut run_style: Option<Style> = None;
-    for (i, &(glyph, fg, sel)) in cells.iter().enumerate().skip(h_scroll).take(width) {
+    for (i, &(glyph, fg, mark)) in cells.iter().enumerate().skip(h_scroll).take(width) {
         // A wide character's continuation cell paints nothing, unless the left edge cut the
         // character itself off, when it stands in as a blank.
         let glyph = match glyph {
@@ -3062,10 +3106,12 @@ fn edit_line_spans(
             '\0' => continue,
             g => g,
         };
-        let mut style = Style::default().fg(fg);
-        if sel {
-            style = style.bg(p.sel_bg);
-        }
+        let style = match mark {
+            1 => Style::default().fg(fg).bg(p.sel_bg),
+            2 => Style::default().fg(fg).bg(p.match_hl),
+            3 => Style::default().fg(p.surface0).bg(p.yellow).add_modifier(Modifier::BOLD),
+            _ => Style::default().fg(fg),
+        };
         if run_style != Some(style) && !run.is_empty() {
             out.push(Span::styled(std::mem::take(&mut run), run_style.unwrap_or_default()));
         }
@@ -3108,12 +3154,24 @@ fn render_edit_confirm(
 
 fn render_find_band(frame: &mut Frame, app: &App, area: Rect) {
     let Some(f) = app.find.as_ref() else { return };
-    let p = app.palette();
+    find_band(frame, area, &f.query, f.caret, app.find_count(), "find in file…", app.palette());
+}
+
+/// One find band: the read pane's and the built-in editor's share its look and its count.
+fn find_band(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    caret: usize,
+    count: Option<(Option<usize>, usize)>,
+    placeholder: &str,
+    p: &Palette,
+) {
     let dim = Style::default().fg(p.dim2);
 
     // The count: `k/total` on a match, the total off a match, `no matches` when nothing matches,
     // blank while the query is empty.
-    let count = match app.find_count() {
+    let count = match count {
         None => String::new(),
         Some((_, 0)) => "no matches".to_string(),
         Some((Some(k), total)) => format!("{k}/{total}"),
@@ -3126,7 +3184,7 @@ fn render_find_band(frame: &mut Frame, app: &App, area: Rect) {
     // The query slice is bounded to `query_w` cells, so a long tail never pushes the count off
     // the right edge.
     let query_w = width.saturating_sub(label.width() + count_w + 1).max(1);
-    let (query_spans, caret_cell_col) = input_line(&f.query, f.caret, query_w, "find in file…", p);
+    let (query_spans, caret_cell_col) = input_line(query, caret, query_w, placeholder, p);
 
     let mut spans = vec![Span::styled(label, Style::default().fg(p.dim0))];
     spans.extend(query_spans);
@@ -3418,6 +3476,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::EditSave => ("^S".into(), "save"),
         A::EditUndo => ("^Z/^Y".into(), "undo/redo"),
         A::EditClipboard => ("^C/^X/^V".into(), "copy/cut/paste"),
+        A::EditFind => ("^F".into(), "find"),
         A::EditAnswerSave => ("s".into(), "save and close"),
         A::EditAnswerDiscard => ("d".into(), "discard"),
         A::EditAnswerOverwrite => ("o".into(), "overwrite"),
