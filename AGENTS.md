@@ -122,7 +122,8 @@ World results land through `land_world_completion`: input-tagged, latest-wins, r
   Staging changes neither: the `uncommitted` diff is `HEAD` vs the worktree, which a stage does not move.
 - `src/editor.rs` - the editor command: a name-keyed dialect table, quote-aware splitting, and the `editor` key's `{file}`/`{line}` template.
   Pure argv resolution; `run_editor` in `lib.rs` owns the spawn and hands the pane over for a terminal editor.
-- `src/export.rs` - comment formatting (`format_all`) and the `ExportTarget` trait, plus the clipboard target (`wl-copy`/`xclip`/`xsel`).
+- `src/export.rs` - comment formatting (`format_all`) and the `ExportTarget` trait, plus the clipboard target: `wl-copy`/`xclip`/`xsel` on a local display, OSC 52 over ssh or with no display (and as the fallback when a tool fails).
+  OSC 52 has no acknowledgement, so it counts as success once written to a terminal stdout.
   `App::export` consumes comments only on `Ok`.
 - `src/agent.rs` - the `send` target over herdr-core or the older herdr.
   `Host` chooses per send: `$HC_TERMINAL_ID` means `hc`, else `$HERDR_PANE_ID` means herdr, else `hc`.

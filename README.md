@@ -35,7 +35,8 @@ Besides the SCM writes, hq-deck writes exactly two refs, `refs/worktree/reviewr/
 - **Linux.**
 - A **Rust toolchain** - it is installed from source.
 - For `s`, one of: **`hc`** ([herdr-core](https://github.com/herdrdev/herdr-core)) on `PATH`, with the agent running in an `hc` terminal; or hq-deck running in a pane of the older **herdr** (0.7.5 or newer).
-- A clipboard tool: `wl-copy`, `xclip`, or `xsel`. `y` and `alt+y` copy through it.
+- On a local display, a clipboard tool: `wl-copy`, `xclip`, or `xsel`. `y` and `alt+y` copy through it.
+  Over ssh, on a remote `hc` machine, or with no display at all, they copy through the terminal with OSC 52 instead, so the terminal you look at must support it (herdr-app, kitty, WezTerm, foot, Alacritty, and tmux with `set-clipboard on` do).
 - **`gh`** (GitHub) or **`glab`** (GitLab), authenticated. Only the **PR** tab needs one.
 - **`claude`** on `PATH`. Only the commit box's ✧ message generator needs it.
 

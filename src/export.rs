@@ -57,17 +57,77 @@ fn counted_comments(count: usize) -> String {
 }
 
 /// A clipboard tool and the args that make it read stdin into the system clipboard. Tried in
-/// order — the first one present on `PATH` wins. Linux needs one of these installed (Wayland
-/// `wl-copy`, or X11 `xclip`/`xsel`). OSC 52 is roadmap.
+/// order - the first one present on `PATH` wins (Wayland `wl-copy`, or X11 `xclip`/`xsel`).
 const CLIPBOARD_TOOLS: &[(&str, &[&str])] = &[
     ("wl-copy", &[]),
     ("xclip", &["-selection", "clipboard"]),
     ("xsel", &["--clipboard", "--input"]),
 ];
 
-/// The system clipboard, via the first available platform clipboard tool.
+/// The reviewer's clipboard. A local display gets a clipboard tool; a session with no display
+/// of its own (over ssh, or in a terminal hosted by a display-less server such as hc on a remote
+/// machine) gets OSC 52, which the reviewer's terminal turns into a clipboard write wherever it
+/// runs. A tool that is missing or fails also falls back to OSC 52.
 #[derive(Debug)]
 pub struct Clipboard;
+
+/// How a copy reaches the reviewer's clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// A clipboard tool on this machine, falling back to the terminal on failure.
+    Tool,
+    /// OSC 52 through the terminal only: this machine's clipboard is not the reviewer's.
+    Terminal,
+}
+
+/// The route for an environment read through `var`. A remote session (`SSH_CONNECTION` or
+/// `SSH_TTY`) or one with neither `WAYLAND_DISPLAY` nor `DISPLAY` has no local clipboard that
+/// the reviewer could paste from, so a tool there would copy into nowhere or fail.
+fn route(var: impl Fn(&str) -> bool) -> Route {
+    let remote = var("SSH_CONNECTION") || var("SSH_TTY");
+    let display = var("WAYLAND_DISPLAY") || var("DISPLAY");
+    if remote || !display { Route::Terminal } else { Route::Tool }
+}
+
+/// The OSC 52 sequence that asks the terminal to put `text` on the clipboard.
+fn osc52(text: &str) -> String {
+    use base64::Engine as _;
+    format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text))
+}
+
+/// Write `text` to the clipboard through the controlling terminal. Between frames the
+/// sequence is invisible to the screen, so it cannot disturb the painted UI. The terminal
+/// gives no acknowledgement, so this succeeds once the sequence is written.
+fn copy_via_terminal(text: &str) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let mut out = std::io::stdout().lock();
+    if !out.is_terminal() {
+        bail!("stdout is not a terminal, so OSC 52 has nowhere to go");
+    }
+    out.write_all(osc52(text).as_bytes()).context("writing OSC 52")?;
+    out.flush().context("flushing OSC 52")
+}
+
+/// Pipe `text` into the first clipboard tool on `PATH`.
+fn copy_via_tool(text: &str) -> Result<()> {
+    let (cmd, args) = select_tool(CLIPBOARD_TOOLS, crate::proc::on_path)
+        .context("no clipboard tool found (install wl-clipboard, xclip, or xsel)")?;
+    let mut child = crate::proc::command(cmd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {cmd}"))?;
+    child
+        .stdin
+        .as_mut()
+        .with_context(|| format!("{cmd} stdin unavailable"))?
+        .write_all(text.as_bytes())
+        .with_context(|| format!("writing to {cmd}"))?;
+    if !child.wait().with_context(|| format!("waiting for {cmd}"))?.success() {
+        bail!("{cmd} exited non-zero");
+    }
+    Ok(())
+}
 
 impl ExportTarget for Clipboard {
     fn label(&self) -> &'static str {
@@ -83,23 +143,13 @@ impl ExportTarget for Clipboard {
     }
 
     fn export(&self, text: &str) -> Result<()> {
-        let (cmd, args) = select_tool(CLIPBOARD_TOOLS, crate::proc::on_path)
-            .context("no clipboard tool found (install wl-clipboard, xclip, or xsel)")?;
-        let mut child = crate::proc::command(cmd)
-            .args(args)
-            .stdin(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("spawning {cmd}"))?;
-        child
-            .stdin
-            .as_mut()
-            .with_context(|| format!("{cmd} stdin unavailable"))?
-            .write_all(text.as_bytes())
-            .with_context(|| format!("writing to {cmd}"))?;
-        if !child.wait().with_context(|| format!("waiting for {cmd}"))?.success() {
-            bail!("{cmd} exited non-zero");
+        match route(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty())) {
+            Route::Terminal => copy_via_terminal(text),
+            Route::Tool => copy_via_tool(text).or_else(|tool_err| {
+                crate::logln!("clipboard tool failed, trying OSC 52: {tool_err:#}");
+                copy_via_terminal(text).map_err(|e| e.context(format!("{tool_err:#}")))
+            }),
         }
-        Ok(())
     }
 }
 
@@ -114,9 +164,28 @@ fn select_tool(
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIPBOARD_TOOLS, Clipboard, ExportTarget, format_all, format_comment, select_tool,
+        CLIPBOARD_TOOLS, Clipboard, ExportTarget, Route, format_all, format_comment, osc52, route,
+        select_tool,
     };
     use crate::model::{Comment, Side};
+
+    #[test]
+    fn route_uses_a_tool_only_on_a_local_display() {
+        let env = |set: &'static [&'static str]| move |name: &str| set.contains(&name);
+        assert_eq!(route(env(&["WAYLAND_DISPLAY"])), Route::Tool);
+        assert_eq!(route(env(&["DISPLAY"])), Route::Tool);
+        // No display: a server-hosted terminal (hc) or a console - the terminal is the way out.
+        assert_eq!(route(env(&[])), Route::Terminal);
+        // Over ssh a forwarded display would still be the remote clipboard, not the reviewer's.
+        assert_eq!(route(env(&["DISPLAY", "SSH_CONNECTION"])), Route::Terminal);
+        assert_eq!(route(env(&["WAYLAND_DISPLAY", "SSH_TTY"])), Route::Terminal);
+    }
+
+    #[test]
+    fn osc52_is_the_clipboard_selection_with_base64_payload() {
+        assert_eq!(osc52("hello"), "\x1b]52;c;aGVsbG8=\x07");
+        assert_eq!(osc52("src/путь.rs"), "\x1b]52;c;c3JjL9C/0YPRgtGMLnJz\x07");
+    }
 
     #[test]
     fn clipboard_tool_selection_prefers_list_order_and_can_be_empty() {
