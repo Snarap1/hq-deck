@@ -182,8 +182,8 @@ impl std::fmt::Display for SendError {
 impl std::error::Error for SendError {}
 
 /// The `hc` error envelope: `{"error":{"kind":...,"message":...}}`.
-fn error_kind(stdout: &str) -> Option<(String, String)> {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+fn error_kind(output: &str) -> Option<(String, String)> {
+    let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
     let error = value.get("error")?;
     Some((
         error.get("kind")?.as_str()?.to_string(),
@@ -324,21 +324,23 @@ impl Agent {
         if out.status.success() {
             return Ok(label);
         }
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        match error_kind(&stdout) {
-            Some((kind, _)) if kind == "blocked" => Err(SendError::Blocked(label)),
-            Some((kind, message)) => {
-                Err(SendError::Failed { agent: label, detail: format!("{kind}: {message}") })
-            }
-            None => Err(SendError::Failed {
-                agent: label,
-                detail: format!(
-                    "{} {}",
-                    stdout.trim(),
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            }),
-        }
+        Err(send_refusal(
+            label,
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ))
+    }
+}
+
+/// Why a failed `hc send` failed. `hc` writes its error envelope to stderr even under `--json`,
+/// so that is where it is read; stdout is the fallback, should a version print it there. A
+/// `blocked` refusal is its own error, so the status line tells the reviewer to answer the
+/// agent rather than calling the send broken.
+fn send_refusal(agent: String, stdout: &str, stderr: &str) -> SendError {
+    match error_kind(stderr).or_else(|| error_kind(stdout)) {
+        Some((kind, _)) if kind == "blocked" => SendError::Blocked(agent),
+        Some((kind, message)) => SendError::Failed { agent, detail: format!("{kind}: {message}") },
+        None => SendError::Failed { agent, detail: format!("{} {}", stdout.trim(), stderr.trim()) },
     }
 }
 
@@ -386,7 +388,8 @@ impl ExportTarget for Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        Host, PickError, Terminal, error_kind, parse_herdr_listing, parse_listing, pasted, pick,
+        Host, PickError, SendError, Terminal, error_kind, parse_herdr_listing, parse_listing,
+        pasted, pick, send_refusal,
     };
     use std::path::Path;
 
@@ -490,5 +493,26 @@ mod tests {
         let out = r#"{"error":{"hint":"h","kind":"blocked","message":"t1 is blocked"}}"#;
         assert_eq!(error_kind(out), Some(("blocked".into(), "t1 is blocked".into())));
         assert_eq!(error_kind("not json"), None);
+    }
+
+    #[test]
+    fn a_blocked_refusal_on_stderr_reads_as_blocked() {
+        // `hc send --json` prints its error envelope on stderr, with stdout empty.
+        let stderr = r#"{"error":{"hint":"h","kind":"blocked","message":"t1 is blocked"}}"#;
+        let err = send_refusal("step2".into(), "", stderr);
+        assert!(matches!(&err, SendError::Blocked(a) if a == "step2"), "{err:?}");
+        let other = r#"{"error":{"kind":"not_found","message":"no terminal \"t9\""}}"#;
+        let err = send_refusal("step2".into(), "", other);
+        assert!(
+            matches!(&err, SendError::Failed { detail, .. } if detail.starts_with("not_found:")),
+            "{err:?}"
+        );
+        // An envelope on stdout still reads, and noise on both streams is kept for the log.
+        assert!(matches!(send_refusal("a".into(), stderr, ""), SendError::Blocked(_)));
+        let err = send_refusal("a".into(), "out", "boom");
+        assert!(
+            matches!(&err, SendError::Failed { detail, .. } if detail == "out boom"),
+            "{err:?}"
+        );
     }
 }
