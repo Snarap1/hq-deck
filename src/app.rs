@@ -4417,9 +4417,17 @@ impl App {
         let diff_anchored = self.diff.view == View::Diff;
         // A content comment reads the worktree whatever the scope.
         let rev = if diff_anchored { self.current_rev() } else { Rev::Worktree };
-        // A content comment counts its lines in the text the File view painted, which may be a
-        // poll older than the disk: the next carry moves it from there.
-        let basis = if diff_anchored { None } else { self.diff.worktree.clone() };
+        // A comment on the worktree side counts its lines in the text the pane painted, which
+        // may be a poll older than the disk: the next carry moves it from there. That is every
+        // content comment and a diff comment on the new side of a worktree scope. An old-side
+        // comment counts in the diff's base, which no worktree edit moves, and a commit's
+        // comment counts in the commit, so neither carries (`diff.worktree` is `None` there
+        // for the commit, and the rev check says so for the reader).
+        let basis = if !diff_anchored || (side == Side::New && rev == Rev::Worktree) {
+            self.diff.worktree.clone()
+        } else {
+            None
+        };
         Some(Comment {
             file,
             side,
@@ -5956,7 +5964,7 @@ fn worktree_text(repo: &std::path::Path, path: &str) -> Option<String> {
 /// Carry the content comments in `store` to their files' text on disk, skipping the `except`
 /// paths. A file with no paintable text leaves its comments where they were.
 fn carry_from_disk(store: &mut CommentStore, repo: &std::path::Path, except: &[Option<String>]) {
-    for file in store.content_files() {
+    for file in store.carried_files() {
         if except.iter().flatten().any(|p| *p == file) {
             continue;
         }
@@ -5966,7 +5974,13 @@ fn carry_from_disk(store: &mut CommentStore, repo: &std::path::Path, except: &[O
     }
 }
 
+/// Whether comment `c` covers `row`. A collapsed fold covers what its hidden lines do, so a
+/// comment carried onto a line a fold hides (the agent reverted the change it was made on) still
+/// has a card, under the fold's marker, instead of vanishing from the diff.
 fn line_in(c: &Comment, row: &Row) -> bool {
+    if let Row::Fold { lines } = row {
+        return lines.iter().any(|line| line_in(c, line));
+    }
     let no = match c.side {
         Side::New => row.new_no(),
         Side::Old => row.old_no(),

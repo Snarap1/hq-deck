@@ -136,10 +136,12 @@ pub struct Comment {
     pub diff_anchored: bool,
     /// Where the new side was read.
     pub rev: Rev,
-    /// For a content comment, the worktree text `start`/`end` count in: a newer version of the
-    /// file is diffed against it to carry them ([`CommentStore::rebase`]). `None` for a diff
-    /// comment, whose numbers belong to its diff, and for a content comment made over text
-    /// that is not the worktree's (a commit's preview), which stays where it was put.
+    /// The worktree text `start`/`end` count in: a newer version of the file is diffed against
+    /// it to carry them ([`CommentStore::rebase`]). Held by a content comment and by a diff
+    /// comment on the new side of a worktree scope, whose new side is the worktree. `None` for
+    /// an old-side diff comment (it counts in the diff's base, which a worktree edit does not
+    /// move), for a commit's comment (its numbers belong to the commit), and for a comment made
+    /// over text that is not the worktree's (a commit's preview): these stay where they were put.
     pub basis: Option<Basis>,
     /// Every line the comment anchored to was deleted by a later change to the file. It sits on
     /// the line just above where they were, and `lines` still holds what they said.
@@ -296,8 +298,9 @@ impl CommentStore {
         std::mem::take(&mut self.items)
     }
 
-    /// The files at least one carried content comment anchors to, each once.
-    pub fn content_files(&self) -> Vec<String> {
+    /// The files at least one worktree-counted comment (it holds a [`Basis`]) anchors to, each
+    /// once.
+    pub fn carried_files(&self) -> Vec<String> {
         let mut files: Vec<String> =
             self.items.iter().filter(|c| c.basis.is_some()).map(|c| c.file.clone()).collect();
         files.sort_unstable();
@@ -305,7 +308,8 @@ impl CommentStore {
         files
     }
 
-    /// Carry every content comment on `file` to `text`, the file's newest version: each moves
+    /// Carry every comment holding a basis on `file` (content, or diff on the new side) to
+    /// `text`, the file's newest version: each moves
     /// by the diff from the version it counts in, then counts in `text`. A comment is never
     /// dropped here: one whose lines were all deleted lands beside the gap, orphaned, and keeps
     /// its snippet. Comments made on one version share one diff.
@@ -436,7 +440,29 @@ mod tests {
         assert_eq!(anchors(&s), [(2, 2, false); 3]);
         s.rebase("a.rs", &Basis::new(&numbered(&["x", "a", "b"])));
         assert_eq!(anchors(&s), [(2, 2, false), (2, 2, false), (3, 3, false)]);
-        assert_eq!(s.content_files(), ["a.rs", "b.rs"]);
+        assert_eq!(s.carried_files(), ["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn a_new_side_diff_comment_with_a_basis_carries_and_an_old_side_one_stays() {
+        let v1 = Basis::new(&numbered(&["a", "b", "c"]));
+        let mut s = CommentStore::new();
+        // Both diff-anchored; only the new side counts in the worktree.
+        s.add(Comment { basis: Some(v1.clone()), ..comment("a.rs", 2, 2, "new side") });
+        s.add(Comment { side: Side::Old, ..comment("a.rs", 2, 2, "old side") });
+        s.add(Comment {
+            rev: Rev::Commit(super::CommitPick::single("abc")),
+            ..comment("a.rs", 2, 2, "commit")
+        });
+        s.rebase("a.rs", &Basis::new(&numbered(&["x", "a", "b", "c"])));
+        assert_eq!(anchors(&s), [(3, 3, false), (2, 2, false), (2, 2, false)]);
+        assert_eq!(s.get(0).unwrap().location(), "a.rs:3");
+        // Reverting the change deletes the line a new-side comment sat on: it stays, orphaned.
+        s.rebase("a.rs", &Basis::new(&numbered(&["a", "c"])));
+        assert_eq!(anchors(&s)[0], (1, 1, true));
+        assert_eq!(s.get(0).unwrap().lines, "+x");
+        assert_eq!(s.get(0).unwrap().location(), "a.rs:1 (since removed)");
+        assert_eq!(s.carried_files(), ["a.rs"]);
     }
 
     #[test]

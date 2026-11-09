@@ -537,8 +537,11 @@ The known constraints:
   Lines added above push it down, and a rewritten line carries it along.
   If every line it was on is deleted, it stays on the line above the gap, marked `(since removed)`, and its snippet still says what those lines were.
   A send always gives the agent the line numbers of the file as it is on disk.
-- **Diff comments are not rebased** - a diff comment stays locatable by its diff snippet, not its line
-  number. hq-deck flags a stale comment instead of dropping it.
+- **Diff comments follow their file too** - a comment on the new side of a diff in the `uncommitted`, `branch`, or `last-turn` scope counts its lines in the worktree and moves with every edit the same way, orphaning included.
+  A comment carried onto a line a collapsed fold hides keeps its card under the fold's marker.
+  A comment on a removed (old-side) line counts in the diff's base, which an edit to the worktree does not move, so it stays put.
+  A comment made in the `commits` scope belongs to its commit and never moves.
+  A diff comment whose file leaves the changeset is flagged stale, never dropped.
 
 **SCM and Git ops**
 - **Every write is yours** — nothing stages, commits, or reaches a remote without the keystroke
