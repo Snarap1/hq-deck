@@ -32,6 +32,8 @@ pub enum Action {
     ScmStageAll,
     ScmUnstageAll,
     ScmMenu,
+    /// Stage/unstage the navigator cursor's file from `Changes`, without entering SCM mode.
+    StageToggle,
     Wrap,
     Preview,
     NavigatorPosition,
@@ -172,7 +174,7 @@ impl Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 50] = [
+const ACTIONS: [(Action, &str, &[Key]); 51] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -199,6 +201,7 @@ const ACTIONS: [(Action, &str, &[Key]); 50] = [
     (Action::ScmStageAll, "scm-stage-all", &[Key::plain('a')]),
     (Action::ScmUnstageAll, "scm-unstage-all", &[Key::plain('U')]),
     (Action::ScmMenu, "scm-menu", &[Key::plain('.')]),
+    (Action::StageToggle, "stage-toggle", &[Key::plain('=')]),
     (Action::Wrap, "wrap", &[Key::plain('w')]),
     (Action::MarkTurn, "mark-turn", &[Key::plain('M')]),
     (Action::Preview, "preview", &[Key::plain('m')]),
@@ -358,6 +361,7 @@ mod tests {
         assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::NavigatorPosition));
         assert_eq!(keymap.action_for(Key::plain('z')), Some(Action::NavigatorHide));
         assert_eq!(keymap.action_for(Key::plain('x')), Some(Action::ScmToggle));
+        assert_eq!(keymap.action_for(Key::plain('=')), Some(Action::StageToggle));
         assert_eq!(keymap.action_for(Key::plain('X')), None);
         assert_eq!(keymap.hint(Action::TabGitOps), Key::plain('4'));
         assert_eq!(keymap.action_for(Key::plain('5')), None, "the `SCM` tab's old slot is gone");

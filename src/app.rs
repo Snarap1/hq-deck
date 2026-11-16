@@ -652,6 +652,9 @@ pub enum FooterAction {
     CopyPath,
     /// Send the same path to the agent; offered wherever `CopyPath` is.
     SendPath,
+    /// Stage/unstage the navigator cursor's file - offered on a `Changes` file row in the
+    /// `uncommitted` scope.
+    StageToggle,
     List,
     Copy,
     Save,
@@ -2559,6 +2562,57 @@ impl App {
         }
         if self.visible.is_empty() {
             self.focus = Focus::Files;
+        }
+    }
+
+    // ---- Stage toggle -----------------------------------
+
+    /// `=` on `Changes`: stage the navigator cursor's file, or unstage it when it is already
+    /// staged - without switching to SCM mode. Reads a fresh status to tell the file's section
+    /// apart (the navigator tree does not split staged from unstaged) and reports through the
+    /// status line. Inert off the `uncommitted` scope, the only diff staging acts on, and off
+    /// `All files`; silent on a directory row, like `copy-path`.
+    pub fn stage_toggle(&mut self) -> Result<()> {
+        self.ensure_config_ready()?;
+        if self.tab != Tab::Changes || self.scope != Scope::Uncommitted {
+            return Ok(());
+        }
+        let Some(path) = self.current_entry().map(|e| e.path.clone()) else { return Ok(()) };
+        let status = crate::git::porcelain::status(&self.repo)?;
+        let (acted, staged) =
+            if let Some(entry) = status.staged.iter().find(|e| e.path == path).cloned() {
+                crate::git::porcelain::unstage(&self.repo, &entry)?;
+                ("unstaged", false)
+            } else if let Some(entry) = status.unstaged.iter().find(|e| e.path == path).cloned() {
+                crate::git::porcelain::stage(&self.repo, &entry)?;
+                ("staged", true)
+            } else {
+                return Ok(());
+            };
+        self.status = format!("{acted} {path}");
+        // Recolor the marker at once - the next world build confirms with its own status
+        // read, but the keypress that named the write answers in the same frame.
+        self.mark_staged(&path, staged);
+        Ok(())
+    }
+
+    /// Flip the staged flag on the changed-file map, the navigator entries, and the painted
+    /// rows - the three places `Annotation` is already carried, so a stage's recolor touches
+    /// nothing else (place state stays put; the tree's shape cannot change from a stage).
+    fn mark_staged(&mut self, path: &str, staged: bool) {
+        if let Some(a) = self.changed.get_mut(path) {
+            a.staged = staged;
+        }
+        for entry in self.entries.iter_mut().filter(|e| e.path == path) {
+            if let Some(a) = &mut entry.annotation {
+                a.staged = staged;
+            }
+        }
+        if let Some(row) = self.file_row_of_path(path)
+            && let file_list::RowKind::File { annotation: Some(a), .. } =
+                &mut self.file_rows[row].kind
+        {
+            a.staged = staged;
         }
     }
 
@@ -5284,6 +5338,10 @@ impl App {
             if matches!(row_kind, Some(RowKind::File { .. })) {
                 out.push((A::CopyPath, Do));
                 out.push((A::SendPath, Do));
+                // Staging acts on the index, so only the `uncommitted` diff's tab offers it.
+                if self.tab == Tab::Changes && self.scope == Scope::Uncommitted {
+                    out.push((A::StageToggle, Do));
+                }
             }
         } else if self.visible.is_empty() {
             if self.navigator_hidden_here() {

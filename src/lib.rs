@@ -2205,6 +2205,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
             K::ScmToggle => app.toggle_scm()?,
+            K::StageToggle => app.stage_toggle()?,
             // Nothing left to do here. The tab switches already ran in `switch_tab` above and
             // are listed only to keep this match exhaustive. `delete` off the diff and `open-pr`
             // off the `PR` tab are inert (`edit` is not: it reaches the navigator's file rows

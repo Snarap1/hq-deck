@@ -39,13 +39,16 @@ pub struct Annotation {
     pub change: ChangeKind,
     pub additions: u32,
     pub deletions: u32,
+    /// The index holds this path's change (uncommitted scope only) - the navigator paints
+    /// the marker in the staged color.
+    pub staged: bool,
 }
 
 impl From<&ChangedFile> for Annotation {
-    /// The scope annotation a changed file carries — the one mapping, shared by the `Changes`
+    /// The scope annotation a changed file carries - the one mapping, shared by the `Changes`
     /// entry build and `app.rs`'s changeset map so a new field can't be wired in one and missed.
     fn from(f: &ChangedFile) -> Self {
-        Self { change: f.kind, additions: f.additions, deletions: f.deletions }
+        Self { change: f.kind, additions: f.additions, deletions: f.deletions, staged: f.staged }
     }
 }
 
@@ -225,6 +228,7 @@ mod tests {
             additions: 1,
             deletions: 0,
             previous_path: None,
+            staged: false,
         }
     }
 

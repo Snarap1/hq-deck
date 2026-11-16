@@ -112,6 +112,9 @@ pub struct ChangedFile {
     /// The old path of a renamed file; `None` for every other kind. Its old content lives
     /// at this path, so a rename diffs real content instead of reading as all-insertion.
     pub previous_path: Option<String>,
+    /// The index holds this path's change - true only in the `uncommitted` scope, where
+    /// staging is meaningful. The navigator paints such a file's marker in the staged color.
+    pub staged: bool,
 }
 
 /// Which side of the diff a comment's lines live on.

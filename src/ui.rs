@@ -2105,7 +2105,10 @@ fn file_row_item(
 
     let mut spans = vec![Span::styled(indent.to_string(), text_style(p))];
     if let Some(a) = annotation {
-        spans.push(Span::styled(marker, Style::default().fg(kind_color(p, a.change.marker()))));
+        // The staged color outranks the kind's: in the `uncommitted` scope the question the
+        // marker answers first is whether the index already holds the change.
+        let color = if a.staged { p.blue } else { kind_color(p, a.change.marker()) };
+        spans.push(Span::styled(marker, Style::default().fg(color)));
     }
     // A git-ignored file recedes into a dim basename; its change marker and stats keep their
     // color so a kept ignored file still reads as a change.
@@ -3422,6 +3425,7 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
         A::ScmMessage => (hint(K::Comment), "message"),
         A::ScmCommit => ("enter".into(), "commit"),
         A::ScmToggle => (hint(K::ScmToggle), if app.scm_active() { "files" } else { "scm" }),
+        A::StageToggle => (hint(K::StageToggle), "stage/unstage"),
         A::Run => ("enter".into(), "run"),
         A::PickBranch => ("enter".into(), "pick"),
         A::ConfirmYesNo => ("y/n".into(), "confirm"),

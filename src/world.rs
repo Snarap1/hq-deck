@@ -130,7 +130,17 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
             Some(t) => Ok(plain(git::changed_against_tree(&input.repo, t)?)),
             None => Ok(plain(Vec::new())),
         },
-        Scope::Uncommitted => Ok(plain(git::changed_files(&input.repo, input.scope, None)?)),
+        Scope::Uncommitted => {
+            let mut changed = git::changed_files(&input.repo, input.scope, None)?;
+            // One status read marks which paths the index already holds, so the navigator's
+            // markers can read staged apart from unstaged. A rename reports at its new path,
+            // the same path the staged list keys by.
+            let status = crate::git::porcelain::status(&input.repo)?;
+            for file in &mut changed {
+                file.staged = status.staged.iter().any(|e| e.path == file.path);
+            }
+            Ok(plain(changed))
+        }
         Scope::Branch => {
             // A resolve failure fails the build whole, so the landing keeps the stale
             // frame and reports — degrading to an empty snapshot would blank a populated

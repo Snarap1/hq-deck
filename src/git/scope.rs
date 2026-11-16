@@ -1327,7 +1327,7 @@ fn assemble(
             continue;
         }
         let (additions, deletions) = counts.get(&path).copied().unwrap_or((0, 0));
-        files.push(ChangedFile { path, kind, additions, deletions, previous_path });
+        files.push(ChangedFile { path, kind, additions, deletions, previous_path, staged: false });
     }
 
     if include_untracked {
@@ -1346,6 +1346,7 @@ fn assemble(
                     additions,
                     deletions: 0,
                     previous_path: None,
+                    staged: false,
                 });
             }
         }

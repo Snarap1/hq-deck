@@ -7074,6 +7074,45 @@ fn scm_tab_stages_and_unstages_and_section_state_survives_a_refresh() {
 }
 
 #[test]
+fn equals_stages_and_unstages_the_navigator_cursor_file_without_scm() {
+    let r = Repo::init();
+    r.write("a.rs", "one\n");
+    r.write("b.rs", "two\n");
+    r.commit_all("init");
+    r.write("a.rs", "one\nchanged\n");
+    r.write("c.rs", "new\n");
+    let mut app = app_on(&r);
+    let keymap = Keymap::default();
+
+    // The navigator cursor rests on a file row in the `uncommitted` scope; `=` stages it
+    // straight from `Changes`, without flipping into SCM mode.
+    assert!(app.scm_open.is_none(), "the SCM panel stays closed");
+    let staged = |app: &App| hq_deck::git::porcelain::status(&app.repo).unwrap().staged;
+    assert!(staged(&app).is_empty(), "nothing staged yet");
+
+    press(&mut app, &keymap, KeyCode::Char('='));
+    assert_eq!(staged(&app).iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["a.rs"]);
+    assert_eq!(app.status, "staged a.rs");
+    // The navigator's marker flips in the same frame, not on the next poll.
+    assert!(
+        app.entries.iter().find(|e| e.path == "a.rs").unwrap().annotation.as_ref().unwrap().staged
+    );
+    // And the world build agrees: its own status read marks the path staged.
+    let build = hq_deck::world::build_changed(&app.world_input()).unwrap();
+    assert!(build.changed.iter().find(|f| f.path == "a.rs").unwrap().staged);
+    assert!(!build.changed.iter().find(|f| f.path == "c.rs").unwrap().staged);
+
+    // Pressing it again unstages: the toggle reads the index fresh each time.
+    press(&mut app, &keymap, KeyCode::Char('='));
+    assert!(staged(&app).is_empty(), "a.rs unstaged back");
+    assert_eq!(app.status, "unstaged a.rs");
+    assert!(
+        !app.entries.iter().find(|e| e.path == "a.rs").unwrap().annotation.as_ref().unwrap().staged,
+        "the marker reads unstaged again"
+    );
+}
+
+#[test]
 fn the_tab_keys_reach_every_tab_from_every_tab() {
     use hq_deck::app::Tab;
 
