@@ -157,6 +157,28 @@ pub fn pick<'a>(
     }
 }
 
+/// The addresses whose foreground cwd is worth fetching before giving up: they pass every
+/// filter but the worktree one, so a stale reported cwd is the only thing keeping them out.
+/// `hc ls` reports the pane's launch directory, which a shell that started an agent never
+/// updates; the live program's own cwd is in `hc get`.
+fn probe_candidates(terminals: &[Terminal], repo: &Path, own: Option<&str>) -> Vec<String> {
+    terminals
+        .iter()
+        .filter(|t| t.state.as_deref().is_none_or(|s| s == "live"))
+        .filter(|t| !t.address.contains('/'))
+        .filter(|t| t.status.is_some())
+        .filter(|t| Some(t.address.as_str()) != own)
+        .filter(|t| t.cwd.as_deref().is_none_or(|cwd| !cwd.starts_with(repo)))
+        .map(|t| t.address.clone())
+        .collect()
+}
+
+/// The live program's cwd from `hc get <t> --json`; `None` when it reports none.
+fn foreground_cwd(json: &str) -> Option<PathBuf> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    value.get("foreground")?.get("cwd")?.as_str().map(PathBuf::from)
+}
+
 /// A failed send, typed so the status line can say what to do.
 #[derive(Debug)]
 pub enum SendError {
@@ -307,10 +329,24 @@ impl Agent {
             .output()
             .map_err(|e| SendError::Failed { agent: "hc".into(), detail: e.to_string() })?;
         let listing = String::from_utf8_lossy(&out.stdout);
-        let terminals = parse_listing(&listing).map_err(|e| SendError::Failed {
+        let mut terminals = parse_listing(&listing).map_err(|e| SendError::Failed {
             agent: "hc".into(),
             detail: format!("{e:#}: {}", String::from_utf8_lossy(&out.stderr).trim()),
         })?;
+        // `hc ls` reports the pane's launch directory, so an agent whose shell has not moved
+        // hides behind a stale cwd; when nothing picks, its live program's cwd decides instead.
+        if pick(&terminals, &self.repo, own) == Err(PickError::None) {
+            for address in probe_candidates(&terminals, &self.repo, own) {
+                let Ok(out) = Self::hc().args(["get", "--json", &address]).output() else {
+                    continue;
+                };
+                if let Some(cwd) = foreground_cwd(&String::from_utf8_lossy(&out.stdout))
+                    && let Some(t) = terminals.iter_mut().find(|t| t.address == address)
+                {
+                    t.cwd = Some(cwd);
+                }
+            }
+        }
         let agent = match pick(&terminals, &self.repo, own) {
             Ok(agent) => agent,
             Err(PickError::None) => return Err(SendError::NoAgent),
@@ -388,8 +424,8 @@ impl ExportTarget for Agent {
 #[cfg(test)]
 mod tests {
     use super::{
-        Host, PickError, SendError, Terminal, error_kind, parse_herdr_listing, parse_listing,
-        pasted, pick, send_refusal,
+        Host, PickError, SendError, Terminal, error_kind, foreground_cwd, parse_herdr_listing,
+        parse_listing, pasted, pick, probe_candidates, send_refusal,
     };
     use std::path::Path;
 
@@ -469,6 +505,78 @@ mod tests {
         {"agent_status":"unknown","cwd":"/w/app","pane_id":"w1:p3","tab_id":"w1:t1",
          "workspace_id":"w1"}
     ]}}"#;
+
+    /// The observed shape: an agent's shell stays at its launch directory, so `hc ls` reports
+    /// a stale cwd; `hc get` has the live program's own one.
+    const STALE_LISTING: &str = r#"{"hidden_finished":17,"terminals":[
+        {"address":"t5g","agent":"zsh","cwd":"/w/other","state":"live","turn":19,"where":"other / 1"},
+        {"address":"t63","agent":"omp","cwd":"/w/other","state":"live","status":"working","turn":0,"where":"app / 1"}
+    ]}"#;
+
+    const GET: &str = r#"{"address":"t63","argv":["/usr/bin/zsh"],"cols":150,"cwd":"/w/other",
+        "foreground":{"argv":["omp"],"cwd":"/w/app/sub","name":"omp","pid":17067},
+        "identity":"ghostty","state":"live","status":{"app":"omp","state":"working"}}"#;
+
+    #[test]
+    fn a_stale_reported_cwd_is_refined_from_the_live_program() {
+        let terminals = parse_listing(STALE_LISTING).unwrap();
+        assert_eq!(
+            pick(&terminals, Path::new("/w/app"), Some("t5g")),
+            Err(PickError::None),
+            "the launch directory is not this worktree"
+        );
+        assert_eq!(
+            probe_candidates(&terminals, Path::new("/w/app"), Some("t5g")),
+            vec!["t63".to_string()],
+            "the shell in another tree is not probed, the agent is"
+        );
+        assert_eq!(foreground_cwd(GET).as_deref(), Some(Path::new("/w/app/sub")));
+        // What `send_through_hc` does with the answer: the live cwd replaces the stale one.
+        let mut refined = terminals;
+        refined[1].cwd = foreground_cwd(GET);
+        assert_eq!(
+            pick(&refined, Path::new("/w/app"), Some("t5g")).unwrap().address,
+            "t63",
+            "the agent works at or under the worktree after all"
+        );
+    }
+
+    #[test]
+    fn foreground_cwd_reads_only_the_live_program() {
+        assert_eq!(
+            foreground_cwd(r#"{"foreground":{"cwd":"/w/app"}}"#).as_deref(),
+            Some(Path::new("/w/app"))
+        );
+        assert_eq!(foreground_cwd(r#"{"foreground":{}}"#), None);
+        assert_eq!(foreground_cwd(r#"{"cwd":"/w/app"}"#), None);
+        assert_eq!(foreground_cwd("not json"), None);
+    }
+
+    #[test]
+    fn probes_only_candidates_kept_out_by_the_worktree_filter() {
+        // cwd missing or outside counts; a cwd inside, a machine address, and the own
+        // terminal do not. Anything status-reporting in another tree is probed: it may be an
+        // agent hiding behind a stale launch directory.
+        let mut inside = agent("t1", "/w/app/sub", "app / 1");
+        inside.status = Some("working".into());
+        let mut elsewhere = agent("t2", "/w/other", "x / 1");
+        elsewhere.status = Some("working".into());
+        let mut remote = agent("box/t3", "/w/other", "x / 1");
+        remote.status = Some("working".into());
+        let mut own = agent("t4", "/w/other", "x / 1");
+        own.status = Some("working".into());
+        let mut no_cwd = agent("t5", "/w/app", "app / 1");
+        no_cwd.cwd = None;
+        no_cwd.status = Some("working".into());
+        assert_eq!(
+            probe_candidates(
+                &[inside, elsewhere, remote, own, no_cwd],
+                Path::new("/w/app"),
+                Some("t4")
+            ),
+            vec!["t2".to_string(), "t5".to_string()]
+        );
+    }
 
     #[test]
     fn a_herdr_listing_maps_onto_the_same_pick() {
